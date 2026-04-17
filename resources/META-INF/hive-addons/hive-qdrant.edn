@@ -1,0 +1,11 @@
+{:addon/id           "hive.qdrant"
+ :addon/type         :native
+ :addon/version      "0.1.0"
+ :addon/init-ns      "hive-qdrant.addon"
+ :addon/init-fn      "create-addon"
+ :addon/config       {:host            "${QDRANT_HOST}"
+                      :port            "${QDRANT_PORT}"
+                      :collection-name "carto-snippets"}
+ :addon/capabilities #{:vector-search :health-reporting :cartography}
+ :addon/dependencies #{}
+ :addon/description  "Qdrant vector DB backend for :carto IMemoryStore slot (cartography snippets)."}
