@@ -87,6 +87,23 @@
     (proto/reset-store! s)
     (is (nil? (proto/get-entry s "r1")))))
 
+;; ---- Payload projection ---------------------------------------------------
+
+(deftest point->entry-tolerates-nil-content
+  (testing "projected payload without :content yields entry sans :content"
+    (let [pt    {:id "abc" :payload {:type "note" :tags ["a"]
+                                     :project-id "p" :created-at "2026-04-20"}}
+          entry (#'store/point->entry pt)]
+      (is (= "abc" (:id entry)))
+      (is (nil? (:content entry)) ":content absent when not included in projection")
+      (is (= "note" (:type entry)))
+      (is (= ["a"] (:tags entry))))))
+
+(deftest point->entry-handles-missing-payload
+  (testing "payload nil -> entry is just id"
+    (let [entry (#'store/point->entry {:id "x" :payload nil})]
+      (is (= {:id "x"} entry)))))
+
 ;; ---- Integration (live qdrant) -------------------------------------------
 
 (deftest ^:integration live-connect-roundtrip

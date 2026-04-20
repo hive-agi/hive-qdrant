@@ -66,7 +66,11 @@
                 (->> (into {} (remove (comp nil? val)))))})
 
 (defn- point->entry
-  "Extract a clj-qdrant point->map (already-decoded payload) back to entry shape."
+  "Extract a clj-qdrant point->map (already-decoded payload) back to entry shape.
+
+   Tolerates nil/absent :content — callers (e.g. query-entries with payload
+   projection) may request a subset of payload fields that excludes :content,
+   in which case the returned entry simply has no :content key."
   [{:keys [id payload]}]
   (cond-> (or payload {})
     id (assoc :id id)))
@@ -251,10 +255,16 @@
                               (and project-id (some? project-id))
                               (assoc :project-id [(str project-id)]))
                flt          (q-api/->filter {:must-keyword must-keyword})
+               ;; Server-side payload projection: catchup only needs
+               ;; metadata — excluding :content keeps response small and
+               ;; avoids dragging embeddings/long-text over the wire.
                resp         (q-api/scroll-points c
                                                  :collection (:collection-name config default-collection)
                                                  :limit (int limit)
-                                                 :filter flt)
+                                                 :filter flt
+                                                 :payload-includes
+                                                 ["type" "tags" "project-id"
+                                                  "duration" "created-at"])
                points       (:points resp)
                ;; Apply :exclude-tags client-side (qdrant lacks negative
                ;; multi-keyword on indexed-list fields without extra config).
