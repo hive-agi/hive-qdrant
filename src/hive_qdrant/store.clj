@@ -75,6 +75,19 @@
   (cond-> (or payload {})
     id (assoc :id id)))
 
+(defn- apply-order-by
+  "Sort `entries` by `order-by` tuple `[field direction]`. `field` is a
+   keyword on the entry map (e.g. :created). `direction` is :asc or :desc.
+   No-op when `order-by` is nil. Qdrant's scroll-points lacks a server-side
+   ORDER BY, so callers must over-fetch via :limit to cover the desired top-N."
+  [entries order-by]
+  (if-let [[field direction] order-by]
+    (let [cmp (if (= direction :desc)
+                #(compare %2 %1)
+                compare)]
+      (vec (sort-by field cmp entries)))
+    entries))
+
 ;; =============================================================================
 ;; Connection wrapper
 ;; =============================================================================
@@ -242,7 +255,7 @@
              {:success? true :id id :backend :fallback})))
      {:op :delete-entry! :id id :args [id]}))
 
-  (query-entries [_this {:keys [type project-id tags exclude-tags limit]
+  (query-entries [_this {:keys [type project-id tags exclude-tags limit order-by]
                          :or   {limit 100}
                          :as   _opts}]
     (if-let [c @client-atom]
@@ -275,11 +288,13 @@
                                         (let [pt (set (get-in p [:payload :tags]))]
                                           (boolean (some excluded pt))))
                                       points))]
-           (mapv point->entry filtered))))
-      (->> (:entries @fallback-atom)
-           vals
-           (take limit)
-           vec)))
+           (-> (mapv point->entry filtered)
+               (apply-order-by order-by)))))
+      (-> (->> (:entries @fallback-atom)
+               vals
+               (take limit)
+               vec)
+          (apply-order-by order-by))))
 
   ;; ---- Semantic search -----------------------------------------------------
 

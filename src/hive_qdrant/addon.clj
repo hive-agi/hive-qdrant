@@ -6,16 +6,23 @@
    take the :default slot — cartography needs its own dedicated store,
    independent of the main memory backend (chroma / milvus).
 
+   Connection config is resolved via hive-di defconfig
+   (see `hive-qdrant.config/QdrantConfig`). Env vars QDRANT_HOST,
+   QDRANT_PORT, QDRANT_API_KEY, QDRANT_TLS drive the connection;
+   explicit values from the addon manifest / init-from-manifest! win as
+   overrides.
+
    Usage (from hive-mcp addon discovery or manual):
      (require '[hive-qdrant.addon :as qdrant-addon])
      (require '[hive-mcp.addons.core :as addons])
 
      (addons/register-addon! (qdrant-addon/create-addon))
      (addons/init-addon! \"hive.qdrant\"
-       {:host \"qdrant.qdrant.svc\" :port 6334
-        :collection-name \"carto_snippets\"})"
-  (:require [hive-mcp.addons.protocol :as addon-proto]
+       {:collection-name \"carto_snippets\"})"
+  (:require [hive-dsl.result :as r]
+            [hive-mcp.addons.protocol :as addon-proto]
             [hive-mcp.protocols.memory :as mem-proto]
+            [hive-qdrant.config :as cfg]
             [hive-qdrant.store :as store]
             [taoensso.timbre :as log]))
 
@@ -35,34 +42,39 @@
 
   (initialize! [_this config]
     (try
-      (let [coerce-port (fn [v]
-                          (cond
-                            (integer? v) v
-                            (and (string? v) (seq v)) (parse-long v)
-                            :else 6334))
-            resolved (-> config
-                         (update :host #(if (and (string? %) (seq %)) % "localhost"))
-                         (update :port coerce-port)
-                         (update :collection-name #(if (and (string? %) (seq %)) %
-                                                       "hive_qdrant_memory")))
-            store    (store/create-store
-                      (select-keys resolved [:host :port :collection-name
-                                             :api-key :tls? :vector-size :distance]))
-            result   (mem-proto/connect! store resolved)]
-        (if (:success? result)
-          (do
-            (reset! store-atom store)
-            (mem-proto/register-store! registry-key store)
-            (log/info "QdrantAddon initialized — registered under"
-                      registry-key
-                      {:host (:host resolved)
-                       :port (:port resolved)
-                       :collection (:collection-name resolved)})
-            {:success? true :errors [] :metadata {:backend "qdrant"
-                                                   :slot    registry-key}})
+      (let [;; Hive-di handles env resolution, blank->nil, and type coercion.
+            ;; Manifest-supplied config is passed as overrides — explicit
+            ;; values win over env, blank strings fall through to env/default.
+            cfg-result (cfg/resolve-QdrantConfig (or config {}))]
+        (if (r/err? cfg-result)
           {:success? false
-           :errors   (:errors result)
-           :metadata {:backend "qdrant"}}))
+           :errors   [(str "QdrantConfig resolution failed: "
+                           (pr-str (:errors cfg-result)))]
+           :metadata {:backend "qdrant"}}
+          (let [resolved (merge (:ok cfg-result)
+                                ;; Carry through store-only knobs that the
+                                ;; operator may override without being part
+                                ;; of the typed QdrantConfig surface.
+                                (select-keys config [:vector-size :distance]))
+                store    (store/create-store
+                          (select-keys resolved [:host :port :collection-name
+                                                 :api-key :tls? :vector-size :distance]))
+                result   (mem-proto/connect! store resolved)]
+            (if (:success? result)
+              (do
+                (reset! store-atom store)
+                (mem-proto/register-store! registry-key store)
+                (log/info "QdrantAddon initialized — registered under"
+                          registry-key
+                          {:host       (:host resolved)
+                           :port       (:port resolved)
+                           :tls?       (:tls? resolved)
+                           :collection (:collection-name resolved)})
+                {:success? true :errors [] :metadata {:backend "qdrant"
+                                                       :slot    registry-key}})
+              {:success? false
+               :errors   (:errors result)
+               :metadata {:backend "qdrant"}}))))
       (catch Exception e
         {:success? false
          :errors   [(.getMessage e)]

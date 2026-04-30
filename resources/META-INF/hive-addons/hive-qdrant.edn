@@ -3,9 +3,10 @@
  :addon/version      "0.1.0"
  :addon/init-ns      "hive-qdrant.addon"
  :addon/init-fn      "create-addon"
- :addon/config       {:host            "${QDRANT_HOST}"
-                      :port            "${QDRANT_PORT}"
-                      :collection-name "carto-snippets"}
+ ;; Connection surface resolved via hive-di — see hive-qdrant.config/QdrantConfig.
+ ;; Env vars: QDRANT_HOST, QDRANT_PORT, QDRANT_API_KEY, QDRANT_TLS.
+ ;; Only fields that diverge from the typed defaults need to live here.
+ :addon/config       {:collection-name "carto-snippets"}
  :addon/capabilities #{:vector-search :health-reporting :cartography}
  :addon/dependencies #{}
  :addon/description  "Qdrant vector DB backend for :carto IMemoryStore slot (cartography snippets)."}
