@@ -7,7 +7,7 @@
         io.github.hive-agi/hive-mcp {:local/root "../hive-mcp"}
 
         ;; Config DI — typed env var resolution with ADT backing
-        io.github.hive-agi/hive-di  {:git/tag "v0.2.0" :git/sha "6ff3e60"}
+        io.github.hive-agi/hive-di  {:git/tag "v0.3.1" :git/sha "ab63fd0"}
         ;; Result monad used by hive-di resolve
         io.github.hive-agi/hive-dsl {:git/tag "v0.4.1" :git/sha "07ab02a"}}
 
