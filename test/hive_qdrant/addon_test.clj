@@ -12,9 +12,17 @@
 
 (use-fixtures :each
   (fn [f]
-    (mem-proto/unregister-store! :carto)
-    (f)
-    (mem-proto/unregister-store! :carto)))
+    (let [snapshot (mem-proto/registered-stores)]
+      (mem-proto/unregister-store! :carto)
+      (mem-proto/unregister-store! :kanban)
+      (try
+        (f)
+        (finally
+          (mem-proto/unregister-store! :carto)
+          (mem-proto/unregister-store! :kanban)
+          (doseq [[k store] snapshot]
+            (when (#{:carto :kanban} k)
+              (mem-proto/register-store! k store))))))))
 
 (defrecord StubStore [state]
   mem-proto/IMemoryStore
@@ -98,6 +106,49 @@
                                      (stub-store))]
     (let [a (addon/create-addon)]
       (addon-proto/initialize! a {:host ""}))))
+
+;; ---- Slot + addon-id parameterization ------------------------------------
+
+(deftest golden-create-addon-with-config-overrides-slot-and-id
+  (let [a (addon/create-addon {:registry-key :kanban
+                               :addon/id     "hive.qdrant.kanban"})]
+    (is (= "hive.qdrant.kanban" (addon-proto/addon-id a)))))
+
+(deftest golden-initialize-registers-under-kanban-when-config-routes
+  (with-redefs [store/create-store (fn [_] (stub-store))]
+    (let [a (addon/create-addon {:registry-key :kanban
+                                 :addon/id     "hive.qdrant.kanban"})
+          r (addon-proto/initialize! a {:registry-key :kanban
+                                        :host "x" :port 6334})]
+      (is (:success? r))
+      (is (= :kanban (-> r :metadata :slot)))
+      (is (some? (mem-proto/get-store :kanban)))
+      (is (thrown? clojure.lang.ExceptionInfo (mem-proto/get-store :carto))))))
+
+(deftest property-two-addons-coexist-on-distinct-slots
+  (with-redefs [store/create-store (fn [_] (stub-store))]
+    (let [carto  (addon/create-addon)
+          kanban (addon/create-addon {:registry-key :kanban
+                                      :addon/id     "hive.qdrant.kanban"})]
+      (addon-proto/initialize! carto  {})
+      (addon-proto/initialize! kanban {:registry-key :kanban})
+      (is (some? (mem-proto/get-store :carto)))
+      (is (some? (mem-proto/get-store :kanban)))
+      (is (not= (mem-proto/get-store :carto)
+                (mem-proto/get-store :kanban)))
+      (addon-proto/shutdown! carto)
+      (is (some? (mem-proto/get-store :kanban)) ":kanban survives :carto shutdown")
+      (addon-proto/shutdown! kanban))))
+
+(deftest property-shutdown-uses-actual-init-slot
+  ;; If create-addon defaulted to :carto but initialize! routed to :kanban,
+  ;; shutdown! must unregister :kanban (the slot actually used), not :carto.
+  (with-redefs [store/create-store (fn [_] (stub-store))]
+    (let [a (addon/create-addon)] ;; default :carto
+      (addon-proto/initialize! a {:registry-key :kanban})
+      (is (some? (mem-proto/get-store :kanban)))
+      (addon-proto/shutdown! a)
+      (is (thrown? clojure.lang.ExceptionInfo (mem-proto/get-store :kanban))))))
 
 (deftest mutation-connect-failure-propagates
   (with-redefs [store/create-store

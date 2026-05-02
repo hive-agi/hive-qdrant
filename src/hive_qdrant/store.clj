@@ -26,6 +26,8 @@
   (:require [clj-qdrant.api :as q-api]
             [clj-qdrant.client :as q-client]
             [clj-qdrant.schema :as q-schema]
+            [clojure.data.json :as json]
+            [clojure.edn :as edn]
             [clojure.string :as str]
             [hive-mcp.protocols.memory :as proto]
             [hive-qdrant.circuit :as circuit]
@@ -65,15 +67,57 @@
                 (update :tags #(when (seq %) (mapv str %)))
                 (->> (into {} (remove (comp nil? val)))))})
 
+(defn- parse-content
+  "Deserialize a stringified :content payload back to its native shape.
+   Hive-mcp's mem-crud writes content as JSON; entries migrated from
+   milvus/proximum may carry the original Clojure-printed map. Try JSON
+   first, fall back to EDN, fall back to the raw string when neither
+   parses. Non-string / nil content is returned untouched."
+  [c]
+  (cond
+    (nil? c)        nil
+    (not (string? c)) c
+    ;; JSON object/array shape
+    (and (#{\{ \[} (first c))
+         (#{\" \: \, \space \] \}} (or (second c) \space)))
+    (or (try (json/read-str c :key-fn keyword) (catch Throwable _ nil))
+        (try (edn/read-string c)               (catch Throwable _ nil))
+        c)
+    ;; EDN map/vec where first inside char is `:` keyword start
+    (#{\{ \[} (first c))
+    (or (try (edn/read-string c)               (catch Throwable _ nil))
+        (try (json/read-str c :key-fn keyword) (catch Throwable _ nil))
+        c)
+    :else c))
+
 (defn- point->entry
   "Extract a clj-qdrant point->map (already-decoded payload) back to entry shape.
+
+   ID resolution: prefer the payload's own :id (the entry's
+   stable identifier — e.g. timestamp `20260401224103-05eb4b95`)
+   over the qdrant point UUID. The qdrant point id is a deterministic
+   UUID hash of the original (see `->uuid-id`); surfacing it would
+   break move/delete-by-id flows that look up entries by their
+   original timestamp string. Only fall back to the qdrant UUID
+   when the payload has no :id (defensive default).
+
+   Content deserialization: qdrant payloads store :content as a
+   serialized string (JSON from hive-mcp's add-entry, EDN from
+   migrations of Clojure-printed content). Parse it back to a map
+   on read so kanban-side predicates (`kanban-task-type?`, status
+   readers) see structured content without round-tripping the
+   string in caller code.
 
    Tolerates nil/absent :content — callers (e.g. query-entries with payload
    projection) may request a subset of payload fields that excludes :content,
    in which case the returned entry simply has no :content key."
   [{:keys [id payload]}]
-  (cond-> (or payload {})
-    id (assoc :id id)))
+  (let [base (or payload {})
+        with-id (cond-> base
+                  (and id (not (:id base))) (assoc :id id))]
+    (if (contains? with-id :content)
+      (update with-id :content parse-content)
+      with-id)))
 
 (defn- apply-order-by
   "Sort `entries` by `order-by` tuple `[field direction]`. `field` is a
@@ -214,19 +258,30 @@
   ;; ---- CRUD ----------------------------------------------------------------
 
   (add-entry! [_this entry]
-    (resilient
-     (fn []
-       (if-let [c @client-atom]
-         (let [vs (:vector-size config default-vector-size)
-               point (entry->point entry vs)]
-           (q-api/upsert-points c
-                                :collection (:collection-name config default-collection)
-                                :points [point])
-           {:success? true :id (:id entry)})
-         ;; fallback in-memory
-         (do (swap! fallback-atom assoc-in [:entries (:id entry)] entry)
-             {:success? true :id (:id entry) :backend :fallback})))
-     {:op :add-entry! :id (:id entry) :args [entry]}))
+    ;; Generate a stable timestamp+hex id when the caller didn't supply
+    ;; one. Mirror's hive-milvus's behaviour (`(or (:id entry)
+    ;; (proto/generate-id))` in record/entry->record-pure). Without
+    ;; this fresh writes via hive-mcp's mem-crud get a nil id back,
+    ;; tripping the contract guard in `crud.write/do-add!`. Migration
+    ;; entries already carry ids; ad-hoc writes (kanban create) do not.
+    (let [entry-id (or (:id entry) (proto/generate-id))
+          entry+id (assoc entry :id entry-id)]
+      (resilient
+       (fn []
+         (if-let [c @client-atom]
+           (let [vs (:vector-size config default-vector-size)
+                 point (entry->point entry+id vs)]
+             (q-api/upsert-points c
+                                  :collection (:collection-name config default-collection)
+                                  :points [point])
+             ;; Contract: return the id string (not the {:success? true ...} map)
+             ;; — matches hive-milvus/hive-chroma so the crud write path's
+             ;; `(string? raw-id)` guard accepts the result.
+             entry-id)
+           ;; fallback in-memory
+           (do (swap! fallback-atom assoc-in [:entries entry-id] entry+id)
+               entry-id)))
+       {:op :add-entry! :id entry-id :args [entry+id]})))
 
   (get-entry [_this id]
     (resilient
@@ -255,8 +310,8 @@
              {:success? true :id id :backend :fallback})))
      {:op :delete-entry! :id id :args [id]}))
 
-  (query-entries [_this {:keys [type project-id tags exclude-tags limit order-by]
-                         :or   {limit 100}
+  (query-entries [_this {:keys [type project-id tags exclude-tags limit order-by include-content?]
+                         :or   {limit 100 include-content? false}
                          :as   _opts}]
     (if-let [c @client-atom]
       (resilient
@@ -271,13 +326,23 @@
                ;; Server-side payload projection: catchup only needs
                ;; metadata — excluding :content keeps response small and
                ;; avoids dragging embeddings/long-text over the wire.
+               ;; Callers needing :content (e.g. scan-state hydrate via
+               ;; cartography.handlers.core/hydrate-state!*) opt in with
+               ;; :include-content? true — kanban 20260425155623-3d508e57.
+               ;; "id" + "content-hash" + "expires" are kanban hot-path
+               ;; needs: callers do move/delete by original timestamp id
+               ;; (not the qdrant UUID), dedupe on content-hash, and
+               ;; respect TTL via :expires. Always project them — the
+               ;; per-row cost is negligible vs the data-integrity gap.
+               payload-keys (cond-> ["id" "type" "tags" "project-id"
+                                     "duration" "created-at" "created"
+                                     "updated" "content-hash" "expires"]
+                              include-content? (conj "content"))
                resp         (q-api/scroll-points c
                                                  :collection (:collection-name config default-collection)
                                                  :limit (int limit)
                                                  :filter flt
-                                                 :payload-includes
-                                                 ["type" "tags" "project-id"
-                                                  "duration" "created-at"])
+                                                 :payload-includes payload-keys)
                points       (:points resp)
                ;; Apply :exclude-tags client-side (qdrant lacks negative
                ;; multi-keyword on indexed-list fields without extra config).
