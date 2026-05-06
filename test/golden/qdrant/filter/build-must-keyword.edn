@@ -1,0 +1,9 @@
+{:all-clauses
+ {:tags ["kanban"], :type ["note"], :project-id ["hive-mcp"]},
+ :empty {},
+ :empty-tags-skip {},
+ :hcr-plural-wins {:project-id ["hive-mcp" "hive-knowledge"]},
+ :pid-plural {:project-id ["hive-mcp" "hive-knowledge"]},
+ :pid-singular {:project-id ["hive"]},
+ :tags-only {:tags ["kanban" "todo"]},
+ :type-only {:type ["note"]}}

@@ -212,6 +212,96 @@
 
 (defn- empty-fallback [] {:entries {}})
 
+;; ── query-entries helpers (SLAP-stratified, railway-oriented) ────────
+;;
+;; Layered by intent (Onion / CPPB):
+;;   • Utility   — defensive coercion (`->type-token`, `->project-id-list`)
+;;   • Mechanism — pure data assembly (`build-must-keyword`,
+;;                 `build-payload-keys`, `exclude-tagged`,
+;;                 `points->ordered-entries`)
+;;   • Boundary  — IO seam (`scroll-collection!`, `query-fallback!`)
+;;
+;; The defrecord method itself stays at the Intent level: a single threaded
+;; pipeline. No mixed abstraction levels, no nested let-soup.
+
+(defn- ->type-token
+  "Utility: coerce :type opt to qdrant must-keyword token list.
+   Handles keyword|string. Returns nil when input is nil so callers can
+   omit the filter clause via `some?`."
+  [t]
+  (when (some? t)
+    [(if (keyword? t) (name t) (str t))]))
+
+(defn- ->project-id-list
+  "Utility: HCR project-scope reconciliation.
+   Plural `:project-ids` wins over singular `:project-id` — descendant
+   aggregation needs OR-over-list, and qdrant `must-keyword` on a list
+   is OR semantics. Returns nil when neither is supplied so the caller
+   omits the filter clause."
+  [project-id project-ids]
+  (cond
+    (seq project-ids)  (mapv str project-ids)
+    (some? project-id) [(str project-id)]
+    :else              nil))
+
+(defn- build-must-keyword
+  "Mechanism: pure opts → qdrant must-keyword filter map.
+   Empty filter (`{}`) means match-all. Each clause is opt-in via predicate
+   so partial filters compose without dummy values."
+  [{:keys [type tags project-id project-ids]}]
+  (let [pid-list (->project-id-list project-id project-ids)]
+    (cond-> {}
+      (seq tags)       (assoc :tags (mapv str tags))
+      (some? type)     (assoc :type (->type-token type))
+      (some? pid-list) (assoc :project-id pid-list))))
+
+(defn- build-payload-keys
+  "Mechanism: pure opts → server-side payload projection list.
+   Always projects kanban hot-path keys (id, content-hash, expires) so
+   move/delete/dedupe paths work without :include-content?. The full
+   :content payload is opt-in to keep response size bounded."
+  [{:keys [include-content?]}]
+  (cond-> ["id" "type" "tags" "project-id"
+           "duration" "created-at" "created"
+           "updated" "content-hash" "expires"]
+    include-content? (conj "content")))
+
+(defn- exclude-tagged
+  "Mechanism: pure — drop points whose tags intersect any `exclude-tags`.
+   Applied client-side because qdrant lacks negative multi-keyword on
+   indexed-list fields without extra config."
+  [points exclude-tags]
+  (let [excluded (set (map str (or exclude-tags [])))]
+    (if (empty? excluded)
+      points
+      (remove (fn [p]
+                (boolean (some excluded (set (get-in p [:payload :tags])))))
+              points))))
+
+(defn- points->ordered-entries
+  "Mechanism: pure — decode qdrant points to entries and apply :order-by."
+  [points order-by]
+  (-> (mapv point->entry points)
+      (apply-order-by order-by)))
+
+(defn- scroll-collection!
+  "Boundary: IO — scroll qdrant with prepared filter + payload projection.
+   Returns the raw response (`:points` is the relevant key downstream)."
+  [client collection-name limit must-keyword payload-keys]
+  (q-api/scroll-points client
+                       :collection collection-name
+                       :limit (int limit)
+                       :filter (q-api/->filter {:must-keyword must-keyword})
+                       :payload-includes payload-keys))
+
+(defn- query-fallback!
+  "Boundary: IO — in-memory fallback when no qdrant client is connected.
+   Linear take over :entries so degraded mode still satisfies the protocol
+   contract (returns ordered seq up to :limit)."
+  [fallback-atom limit order-by]
+  (-> (->> (:entries @fallback-atom) vals (take limit) vec)
+      (apply-order-by order-by)))
+
 ;; =============================================================================
 ;; Store record
 ;; =============================================================================
@@ -284,13 +374,21 @@
        {:op :add-entry! :id entry-id :args [entry+id]})))
 
   (get-entry [_this id]
+    ;; q-api/get-points returns RAW protobuf points; the clj-qdrant
+    ;; `point->map` decoder must run before our `point->entry` shape
+    ;; conversion. Without it, destructure on `{:keys [id payload]}`
+    ;; in `point->entry` yields nil for both fields, returning an
+    ;; entry stripped of tags/content — invisible to `kanban-entry?`
+    ;; predicate and surfacing as a misleading "Entry not found" on
+    ;; move/delete. `query-entries` doesn't suffer this because
+    ;; `scroll-points` already decodes server-side.
     (resilient
      (fn []
        (if-let [c @client-atom]
          (let [res (q-api/get-points c
                                      :collection (:collection-name config default-collection)
                                      :ids [(->uuid-id id)])]
-           (some-> (first (:points res)) point->entry (assoc :id id)))
+           (some-> (first (:points res)) q-api/point->map point->entry (assoc :id id)))
          (get-in @fallback-atom [:entries id])))))
 
   (update-entry! [this id updates]
@@ -310,56 +408,24 @@
              {:success? true :id id :backend :fallback})))
      {:op :delete-entry! :id id :args [id]}))
 
-  (query-entries [_this {:keys [type project-id tags exclude-tags limit order-by include-content?]
-                         :or   {limit 100 include-content? false}
-                         :as   _opts}]
-    (if-let [c @client-atom]
-      (resilient
-       (fn []
-         (let [must-keyword (cond-> {}
-                              (seq tags)         (assoc :tags (mapv str tags))
-                              (and type (some? type))
-                              (assoc :type [(if (keyword? type) (name type) (str type))])
-                              (and project-id (some? project-id))
-                              (assoc :project-id [(str project-id)]))
-               flt          (q-api/->filter {:must-keyword must-keyword})
-               ;; Server-side payload projection: catchup only needs
-               ;; metadata — excluding :content keeps response small and
-               ;; avoids dragging embeddings/long-text over the wire.
-               ;; Callers needing :content (e.g. scan-state hydrate via
-               ;; cartography.handlers.core/hydrate-state!*) opt in with
-               ;; :include-content? true — kanban 20260425155623-3d508e57.
-               ;; "id" + "content-hash" + "expires" are kanban hot-path
-               ;; needs: callers do move/delete by original timestamp id
-               ;; (not the qdrant UUID), dedupe on content-hash, and
-               ;; respect TTL via :expires. Always project them — the
-               ;; per-row cost is negligible vs the data-integrity gap.
-               payload-keys (cond-> ["id" "type" "tags" "project-id"
-                                     "duration" "created-at" "created"
-                                     "updated" "content-hash" "expires"]
-                              include-content? (conj "content"))
-               resp         (q-api/scroll-points c
-                                                 :collection (:collection-name config default-collection)
-                                                 :limit (int limit)
-                                                 :filter flt
-                                                 :payload-includes payload-keys)
-               points       (:points resp)
-               ;; Apply :exclude-tags client-side (qdrant lacks negative
-               ;; multi-keyword on indexed-list fields without extra config).
-               excluded     (set (map str (or exclude-tags [])))
-               filtered     (if (empty? excluded)
-                              points
-                              (remove (fn [p]
-                                        (let [pt (set (get-in p [:payload :tags]))]
-                                          (boolean (some excluded pt))))
-                                      points))]
-           (-> (mapv point->entry filtered)
-               (apply-order-by order-by)))))
-      (-> (->> (:entries @fallback-atom)
-               vals
-               (take limit)
-               vec)
-          (apply-order-by order-by))))
+  (query-entries
+    ;; Intent layer (SLAP): single-pipeline orchestration.
+    ;; Stratified-design layers — Boundary (scroll/fallback), Mechanism
+    ;; (filter/projection/decode), Utility (coercion) — live as private
+    ;; defns above the defrecord. The method body only chooses live vs
+    ;; fallback and threads decoded data through the pure pipeline.
+    [_this {:keys [exclude-tags limit order-by] :or {limit 100} :as opts}]
+    (let [collection-name (:collection-name config default-collection)]
+      (if-let [c @client-atom]
+        (resilient
+         (fn []
+           (-> (scroll-collection! c collection-name limit
+                                   (build-must-keyword opts)
+                                   (build-payload-keys opts))
+               :points
+               (exclude-tagged exclude-tags)
+               (points->ordered-entries order-by))))
+        (query-fallback! fallback-atom limit order-by))))
 
   ;; ---- Semantic search -----------------------------------------------------
 
@@ -388,9 +454,31 @@
 
   ;; ---- Duplicate detection -------------------------------------------------
 
-  (find-duplicate [_this _type content-hash _opts]
-    ;; Fallback-only: scan payloads for matching :content-hash.
-    (when-not @client-atom
+  (find-duplicate [_this type content-hash {:keys [project-id]}]
+    ;; Server-side scroll on indexed :content-hash payload (idx created in
+    ;; ensure-payload-indexes!). Without this, every cartography rescan saw
+    ;; every form as new — fresh ids → orphaned qdrant points → KG edges
+    ;; pointing at stale UUIDs (kanban 20260503210515-306bfe41).
+    ;;
+    ;; Read-only + idempotent — never queues, never throws. On scroll failure
+    ;; (transport, schema mismatch) returns nil so callers fall through to
+    ;; fresh-insert; the worst case degrades to pre-fix behaviour.
+    (if-let [c @client-atom]
+      (try
+        (let [must-keyword (cond-> {:content-hash [(str content-hash)]}
+                             (some? type)       (assoc :type (->type-token type))
+                             (some? project-id) (assoc :project-id [(str project-id)]))
+              resp         (scroll-collection!
+                            c
+                            (:collection-name config default-collection)
+                            1
+                            must-keyword
+                            ["id" "type" "tags" "project-id" "content-hash"])]
+          (some-> (first (:points resp)) point->entry))
+        (catch Throwable t
+          (log/debug "find-duplicate scroll failed; returning nil:" (ex-message t))
+          nil))
+      ;; Fallback in-memory mode: linear scan.
       (first
        (filter #(= content-hash (:content-hash %))
                (vals (:entries @fallback-atom))))))

@@ -104,6 +104,46 @@
     (let [entry (#'store/point->entry {:id "x" :payload nil})]
       (is (= {:id "x"} entry)))))
 
+;; ---- find-duplicate (rescan idempotency, kanban 20260503210515-306bfe41) ----
+
+(deftest find-duplicate-fallback-matches-by-content-hash
+  (testing "fallback mode: returns the existing entry sharing :content-hash"
+    (let [s (fresh-store)]
+      (proto/add-entry! s {:id "e1" :type :snippet :content "x"
+                           :content-hash "abc123" :project-id "p"})
+      (let [hit (proto/find-duplicate s :snippet "abc123" {:project-id "p"})]
+        (is (some? hit) "must locate by content-hash")
+        (is (= "e1" (:id hit)))))))
+
+(deftest find-duplicate-fallback-nil-on-miss
+  (testing "fallback mode: returns nil when no entry has matching hash"
+    (let [s (fresh-store)]
+      (proto/add-entry! s {:id "e1" :type :snippet :content "x"
+                           :content-hash "abc123" :project-id "p"})
+      (is (nil? (proto/find-duplicate s :snippet "DOES-NOT-EXIST" {:project-id "p"}))))))
+
+(deftest ^:integration live-find-duplicate-rescan-idempotency
+  (testing "rescan with same content-hash reuses existing id (no qdrant dups)"
+    (let [s (store/create-store {:host "localhost" :port 6334
+                                 :collection-name "test_find_dup" :vector-size 4})
+          r (proto/connect! s {})]
+      (when (:success? r)
+        (let [hash "RESCAN-HASH-1"
+              id1  "ITEST-DUP-1"
+              base {:type :snippet :content "snip" :content-hash hash
+                    :project-id "p" :embedding [0.1 0.2 0.3 0.4]}]
+          (proto/add-entry! s (assoc base :id id1))
+          ;; First find-duplicate must locate id1.
+          (let [hit (proto/find-duplicate s :snippet hash {:project-id "p"})]
+            (is (some? hit) "post-insert: find-duplicate must surface the entry")
+            (is (= id1 (:id hit)) "must return the original id, not a fresh UUID")
+            ;; Simulating scan reuse path: fresh id materialised, but
+            ;; rebound to existing id when find-duplicate hits → only
+            ;; one point under id1's UUID.
+            (is (= id1 (:id (proto/get-entry s id1)))))
+          (proto/delete-entry! s id1)
+          (proto/disconnect! s))))))
+
 ;; ---- Integration (live qdrant) -------------------------------------------
 
 (deftest ^:integration live-connect-roundtrip
@@ -114,3 +154,20 @@
                            :embedding [0.1 0.2 0.3 0.4]})
       (is (:success? (proto/store-status s)))
       (proto/disconnect! s))))
+
+(deftest ^:integration live-add-get-preserves-payload
+  (testing "get-entry round-trip survives qdrant decode (regression: missing q-api/point->map)"
+    (let [s (store/create-store {:host "localhost" :port 6334 :vector-size 4})
+          r (proto/connect! s {})]
+      (when (:success? r)
+        (let [id "ITEST-RT-1"
+              tags ["kanban" "todo" "priority-medium" "scope:project:test"]]
+          (proto/add-entry! s {:id id :type :note :content "round-trip"
+                                :tags tags :embedding [0.1 0.2 0.3 0.4]})
+          (let [fetched (proto/get-entry s id)]
+            (is (some? fetched) "get-entry returns the entry, not nil")
+            (is (= id (:id fetched)) "id preserved")
+            (is (= tags (:tags fetched)) "tags survive the decode")
+            (is (some? (:content fetched)) "content payload survives the decode"))
+          (proto/delete-entry! s id))
+        (proto/disconnect! s)))))
