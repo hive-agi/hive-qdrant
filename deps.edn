@@ -4,12 +4,12 @@
         com.taoensso/timbre       {:mvn/version "6.8.0"}
         io.github.hive-agi/clj-qdrant     {:git/tag "v0.1.1" :git/sha "ad9d4bb"}
         ;; hive-mcp protocols (IMemoryStore, IAddon) — local root for dev
-        io.github.hive-agi/hive-mcp {:git/tag "v0.16.6" :git/sha "637fb28"}
+        io.github.hive-agi/hive-mcp {:git/tag "v0.16.7" :git/sha "0222203"}
 
         ;; Config DI — typed env var resolution with ADT backing
         io.github.hive-agi/hive-di  {:git/tag "v0.3.1" :git/sha "ab63fd0"}
         ;; Result monad used by hive-di resolve
-        io.github.hive-agi/hive-dsl {:git/tag "v0.4.1" :git/sha "07ab02a"}}
+        io.github.hive-agi/hive-dsl {:git/tag "v0.5.1" :git/sha "335869e"}}
 
  :aliases
  {:dev  {:extra-paths ["dev" "test"]
