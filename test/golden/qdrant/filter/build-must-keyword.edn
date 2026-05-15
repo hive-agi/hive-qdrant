@@ -1,9 +1,12 @@
 {:all-clauses
- {:tags ["kanban"], :type ["note"], :project-id ["hive-mcp"]},
+ {:must-keyword {:tags ["kanban"], :type ["note"]},
+  :must-match-any {:project-id ["hive-mcp"]}},
  :empty {},
  :empty-tags-skip {},
- :hcr-plural-wins {:project-id ["hive-mcp" "hive-knowledge"]},
- :pid-plural {:project-id ["hive-mcp" "hive-knowledge"]},
- :pid-singular {:project-id ["hive"]},
- :tags-only {:tags ["kanban" "todo"]},
- :type-only {:type ["note"]}}
+ :hcr-plural-wins
+ {:must-match-any {:project-id ["hive-mcp" "hive-knowledge"]}},
+ :pid-plural
+ {:must-match-any {:project-id ["hive-mcp" "hive-knowledge"]}},
+ :pid-singular {:must-match-any {:project-id ["hive"]}},
+ :tags-only {:must-keyword {:tags ["kanban" "todo"]}},
+ :type-only {:must-keyword {:type ["note"]}}}

@@ -246,14 +246,28 @@
 
 (defn- build-must-keyword
   "Mechanism: pure opts → qdrant must-keyword filter map.
-   Empty filter (`{}`) means match-all. Each clause is opt-in via predicate
-   so partial filters compose without dummy values."
+
+   Returns a map shaped for `q-api/->filter` consumption:
+
+     {:must-keyword   {:tags [...] :type [...]}    ; AND-of-values per field
+      :must-match-any {:project-id [...]}}         ; OR-of-values on field
+
+   `:project-id` is single-valued on each entry, so multi-scope HCR queries
+   need MatchAny (OR) semantics via `must-match-any`. Tag filters keep
+   AND-of-values semantics: callers asking for tags = [\"kanban\" \"todo\"]
+   expect entries carrying BOTH tags. Empty filter (`{}` under each key)
+   means match-all on that branch. Each clause is opt-in via predicate so
+   partial filters compose without dummy values."
   [{:keys [type tags project-id project-ids]}]
-  (let [pid-list (->project-id-list project-id project-ids)]
+  (let [pid-list (->project-id-list project-id project-ids)
+        and-keys (cond-> {}
+                   (seq tags)   (assoc :tags (mapv str tags))
+                   (some? type) (assoc :type (->type-token type)))
+        any-keys (cond-> {}
+                   (some? pid-list) (assoc :project-id pid-list))]
     (cond-> {}
-      (seq tags)       (assoc :tags (mapv str tags))
-      (some? type)     (assoc :type (->type-token type))
-      (some? pid-list) (assoc :project-id pid-list))))
+      (seq and-keys) (assoc :must-keyword and-keys)
+      (seq any-keys) (assoc :must-match-any any-keys))))
 
 (defn- build-payload-keys
   "Mechanism: pure opts → server-side payload projection list.
@@ -286,12 +300,14 @@
 
 (defn- scroll-collection!
   "Boundary: IO — scroll qdrant with prepared filter + payload projection.
+   `filter-opts` is the map shape consumed by `q-api/->filter`:
+   `{:must-keyword {...} :must-match-any {...}}`.
    Returns the raw response (`:points` is the relevant key downstream)."
-  [client collection-name limit must-keyword payload-keys]
+  [client collection-name limit filter-opts payload-keys]
   (q-api/scroll-points client
                        :collection collection-name
                        :limit (int limit)
-                       :filter (q-api/->filter {:must-keyword must-keyword})
+                       :filter (q-api/->filter filter-opts)
                        :payload-includes payload-keys))
 
 (defn- query-fallback!
@@ -465,14 +481,20 @@
     ;; fresh-insert; the worst case degrades to pre-fix behaviour.
     (if-let [c @client-atom]
       (try
-        (let [must-keyword (cond-> {:content-hash [(str content-hash)]}
-                             (some? type)       (assoc :type (->type-token type))
-                             (some? project-id) (assoc :project-id [(str project-id)]))
+        (let [and-keys (cond-> {:content-hash [(str content-hash)]}
+                         (some? type) (assoc :type (->type-token type)))
+              ;; Singleton :project-id can ride the same MatchAny path —
+              ;; a single-element OR-list is equivalent to the legacy
+              ;; per-value matchKeyword loop and keeps semantics uniform.
+              any-keys (cond-> {}
+                         (some? project-id) (assoc :project-id [(str project-id)]))
+              filter-opts (cond-> {:must-keyword and-keys}
+                            (seq any-keys) (assoc :must-match-any any-keys))
               resp         (scroll-collection!
                             c
                             (:collection-name config default-collection)
                             1
-                            must-keyword
+                            filter-opts
                             ["id" "type" "tags" "project-id" "content-hash"])]
           (some-> (first (:points resp)) point->entry))
         (catch Throwable t
@@ -504,6 +526,49 @@
         (catch Throwable t
           (log/warn "reset-store! recreate failed:" (ex-message t)))))
     {:success? true}))
+
+;; =============================================================================
+;; IMemoryStoreLiveness — cross-store resilience seam
+;; =============================================================================
+;;
+;; Qdrant resilience model differs from Milvus: passive circuit-breaker +
+;; in-memory fallback rather than an active heal loop. The protocol
+;; implementation here is a thin adapter:
+;;
+;; -probe!            — true iff connected?-atom is set; no real RPC. Cheap
+;;                      and accurate for qdrant since `connect!` flips the
+;;                      flag based on a successful schema check.
+;; -kick-reconnect!   — close existing client, attempt reconnect via the
+;;                      stored `config`. Idempotent: re-running connect!
+;;                      with the same config is a no-op when already up.
+;; -await-reconnect!  — poll `connected?-atom` up to budget-ms, 100ms cadence.
+;;
+;; The fallback-atom path means qdrant degrades gracefully under load even
+;; without a heal loop; the protocol seam is here primarily so the
+;; resilience layer can drive recovery on transient transport failures
+;; (NAT idle-timeout, ingress flap) without importing qdrant internals.
+
+(require '[hive-mcp.protocols.memory-liveness :as liveness])
+
+(extend-protocol liveness/IMemoryStoreLiveness
+  QdrantMemoryStore
+  (-probe! [this]
+    (boolean @(:connected?-atom this)))
+  (-kick-reconnect! [this]
+    (proto/disconnect! this)
+    (try
+      (proto/connect! this (:config this))
+      (catch Throwable t
+        (log/warn "qdrant kick-reconnect! connect attempt failed:" (ex-message t))))
+    nil)
+  (-await-reconnect! [this budget-ms]
+    (let [deadline (+ (System/currentTimeMillis) budget-ms)
+          a (:connected?-atom this)]
+      (loop []
+        (cond
+          @a true
+          (>= (System/currentTimeMillis) deadline) (boolean @a)
+          :else (do (Thread/sleep 100) (recur)))))))
 
 ;; =============================================================================
 ;; Factory

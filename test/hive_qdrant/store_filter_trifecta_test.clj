@@ -160,30 +160,61 @@
                     (some? pid)       (assoc :project-id pid)
                     (some? pids)      (assoc :project-ids pids)))
    :pred        (fn [out]
+                  ;; Shape: {:must-keyword {:tags|:type [...]}
+                  ;;         :must-match-any {:project-id [...]}}
+                  ;; Each top-level key is optional. Inner values are vecs.
                   (and (map? out)
-                       (every? #{:tags :type :project-id} (keys out))
-                       (every? #(or (vector? %) (sequential? %)) (vals out))))
+                       (every? #{:must-keyword :must-match-any} (keys out))
+                       (let [mk  (:must-keyword out)
+                             mma (:must-match-any out)]
+                         (and (or (nil? mk) (and (map? mk)
+                                                 (every? #{:tags :type} (keys mk))
+                                                 (every? #(or (vector? %) (sequential? %)) (vals mk))))
+                              (or (nil? mma) (and (map? mma)
+                                                  (every? #{:project-id} (keys mma))
+                                                  (every? #(or (vector? %) (sequential? %)) (vals mma))))))))
    :num-tests   200
    :mutations   [["always-empty"        (fn [_] {})]
+                 ;; Mutation: project-id routed to the AND branch instead of
+                 ;; the OR branch. Catches regressions that drop the
+                 ;; matchKeywords (MatchAny) path back into matchKeyword
+                 ;; (AND-of-keywords) — the original ENGINE-friction bug.
+                 ["pid-on-and-branch"   (fn [{:keys [type tags project-id project-ids]}]
+                                          (let [and-keys (cond-> {}
+                                                           (seq tags)
+                                                           (assoc :tags (mapv str tags))
+                                                           (some? type)
+                                                           (assoc :type [(if (keyword? type)
+                                                                           (name type)
+                                                                           (str type))])
+                                                           (seq project-ids)
+                                                           (assoc :project-id (mapv str project-ids))
+                                                           (and (empty? project-ids) (some? project-id))
+                                                           (assoc :project-id [(str project-id)]))]
+                                            (cond-> {}
+                                              (seq and-keys) (assoc :must-keyword and-keys))))]
                  ["singular-pid-wins"   (fn [{:keys [type tags project-id project-ids]}]
-                                          (cond-> {}
-                                            (seq tags)         (assoc :tags (mapv str tags))
-                                            (some? type)       (assoc :type [(if (keyword? type)
-                                                                               (name type)
-                                                                               (str type))])
-                                            (some? project-id) (assoc :project-id [(str project-id)])
-                                            (and (empty? project-id) (seq project-ids))
-                                            (assoc :project-id (mapv str project-ids))))]
-                 ["wrong-pid-key"       (fn [{:keys [project-id project-ids] :as opts}]
-                                          (cond-> {}
-                                            (seq (:tags opts))    (assoc :tags (mapv str (:tags opts)))
-                                            (some? (:type opts))  (assoc :type [(name (:type opts))])
-                                            (seq project-ids)     (assoc :project-ids (mapv str project-ids))
-                                            (and (empty? project-ids) (some? project-id))
-                                            (assoc :project-id [(str project-id)])))]
+                                          (let [and-keys (cond-> {}
+                                                           (seq tags)
+                                                           (assoc :tags (mapv str tags))
+                                                           (some? type)
+                                                           (assoc :type [(if (keyword? type)
+                                                                           (name type)
+                                                                           (str type))]))
+                                                ;; Singular wins — wrong because plural is HCR descendant
+                                                ;; bundle aggregated across the tree.
+                                                any-keys (cond-> {}
+                                                           (some? project-id)
+                                                           (assoc :project-id [(str project-id)])
+                                                           (and (nil? project-id) (seq project-ids))
+                                                           (assoc :project-id (mapv str project-ids)))]
+                                            (cond-> {}
+                                              (seq and-keys) (assoc :must-keyword and-keys)
+                                              (seq any-keys) (assoc :must-match-any any-keys))))]
                  ["drop-tag-coercion"   (fn [opts]
                                           (cond-> {}
-                                            (seq (:tags opts)) (assoc :tags (:tags opts))))]]})
+                                            (seq (:tags opts)) (assoc :must-keyword
+                                                                      {:tags (:tags opts)})))]]})
 
 ;; =============================================================================
 ;; 4. build-payload-keys — opts → server-side projection list
@@ -270,5 +301,14 @@
     (let [out (#'store/build-must-keyword
                 {:project-id "hive"
                  :project-ids ["hive-mcp" "hive-knowledge"]})]
-      (is (= ["hive-mcp" "hive-knowledge"] (:project-id out))
-          "plural list, NOT [\"hive\"] — descendant bundle = OR-over-list"))))
+      (is (= ["hive-mcp" "hive-knowledge"]
+             (get-in out [:must-match-any :project-id]))
+          "plural list, NOT [\"hive\"] — descendant bundle = OR-over-list")
+      (is (nil? (get-in out [:must-keyword :project-id]))
+          "project-id MUST NOT appear on the AND branch — that's the
+           legacy bug where each pid became a separate MUST condition,
+           making the filter unsatisfiable.")))
+
+  (testing "single project-id rides the MatchAny path too — uniform semantics"
+    (let [out (#'store/build-must-keyword {:project-id "hive-mcp"})]
+      (is (= ["hive-mcp"] (get-in out [:must-match-any :project-id]))))))
