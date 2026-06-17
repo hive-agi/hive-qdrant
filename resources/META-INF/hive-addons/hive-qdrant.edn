@@ -1,4 +1,5 @@
 {:addon/id           "hive.qdrant"
+ :addon/kind         :library
  :addon/type         :native
  :addon/version      "0.1.0"
  :addon/init-ns      "hive-qdrant.addon"
