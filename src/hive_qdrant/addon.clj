@@ -37,6 +37,8 @@
        {:collection-name \"carto_snippets\"})"
   (:require [hive-dsl.result :as r]
             [hive-mcp.addons.protocol :as addon-proto]
+            [hive-mcp.embeddings.protocol :as embed-proto]
+            [hive-mcp.embeddings.service :as embed-svc]
             [hive-mcp.protocols.memory :as mem-proto]
             [hive-qdrant.config :as cfg]
             [hive-qdrant.store :as store]
@@ -61,6 +63,28 @@
    :addon-id (manual) > slot-atom-default."
   [config default-id]
   (or (:addon/id config) (:addon-id config) default-id))
+
+(defn- make-embedder
+  "Build the injected snippet embedder for a slot, or nil.
+
+   Only slots whose manifest opts in via `:embed-type` (the :carto slot) get a
+   vectorizer; the :kanban slot omits it and keeps zero-vector writes. The model
+   is NOT hardcoded — it is resolved per call from the `:embedder` registry in
+   `~/.config/hive-mcp/config.edn` via `resolve-provider-for-type`, so swapping
+   the model is a config-only change (DI). Per-call resolution also makes this
+   robust to addon/embedding-service boot order and live config edits. The
+   `:carto-snippet` type falls back to the memory lane's default provider
+   (qwen3-embedding:4b, 2560d) — the shared space with memory. Never throws."
+  [embed-type]
+  (when embed-type
+    (let [etype (keyword embed-type)]
+      (fn [text]
+        (try
+          (when-let [provider (:provider (embed-svc/resolve-provider-for-type etype))]
+            (embed-proto/embed-text provider text))
+          (catch Throwable t
+            (log/debug "carto embed failed (degrading to zero-vec):" (ex-message t))
+            nil))))))
 
 (defrecord QdrantAddon [store-atom slot-atom addon-id-atom]
   addon-proto/IAddon
@@ -89,9 +113,11 @@
                                 ;; operator may override without being part
                                 ;; of the typed QdrantConfig surface.
                                 (select-keys config [:vector-size :distance]))
+                embedder (make-embedder (:embed-type config))
                 store    (store/create-store
-                          (select-keys resolved [:host :port :collection-name
-                                                 :api-key :tls? :vector-size :distance]))
+                          (cond-> (select-keys resolved [:host :port :collection-name
+                                                         :api-key :tls? :vector-size :distance])
+                            embedder (assoc :embedder embedder)))
                 result   (mem-proto/connect! store resolved)]
             (if (:success? result)
               (do

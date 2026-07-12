@@ -54,13 +54,91 @@
 
 (defn- zero-vec [n] (vec (repeat n 0.0)))
 
+(defn- ->embed-text
+  "Text handed to the embedder for an entry. Content may already be a
+   serialized string (mem-crud writes JSON) or a native map (kanban/carto
+   callers); either way the embedder needs one string."
+  [content]
+  (cond
+    (nil? content)    nil
+    (string? content) (when-not (str/blank? content) content)
+    :else             (pr-str content)))
+
+(defn- dim-mismatch
+  "Guard: qdrant fixes the vector width per collection. A vector of the wrong
+   width is not a degraded answer, it is a wrong one — upserting/searching it
+   writes or queries garbage. Returns an error map, or nil when the width is
+   right. (Mirrors hive-milvus's :embedder/dim-mismatch.)"
+  [v vector-size stage]
+  (when (and vector-size (seq v) (not= (count v) vector-size))
+    {:success? false
+     :error    :qdrant/dim-mismatch
+     :stage    stage
+     :expected vector-size
+     :actual   (count v)
+     :message  (str "embedding dimension " (count v) " != collection vector-size "
+                    vector-size " — refusing to " (name stage)
+                    ". Route an embedder whose dimension matches the collection, "
+                    "or recreate the collection at the embedder's dimension.")}))
+
+(defonce ^:private unembedded-warned (atom #{}))
+
+(defn- warn-unembedded!
+  "One warn per collection: this slot writes structural (zero) vectors."
+  [collection]
+  (when-not (contains? @unembedded-warned collection)
+    (swap! unembedded-warned conj collection)
+    (log/warn "hive-qdrant: no embedder injected for collection" collection
+              "— points carry placeholder vectors; semantic search is UNAVAILABLE"
+              "on this slot (payload/tag reads are unaffected).")))
+
+(defn- resolve-vector
+  "The vector for one write or one search — or a loud error.
+
+   {:vector v}         usable: explicit `:embedding`, else `(embedder text)`.
+   {:error m}          an embedding lane EXISTS but produced nothing usable, or
+                       the vector's width does not match the collection.
+   {:no-embedder true} the slot has no embedding lane at all (kanban is
+                       structurally addressed: tag/payload reads only).
+
+   The one thing this never does is substitute a zero vector for a failed
+   embed. A zero vector scores 0.0 against every other zero vector, so qdrant
+   returns arbitrary points and reports success — the exact silence that hid
+   this bug. Zeros are only ever written on the explicit :no-embedder path,
+   where the caller has declared it does not want semantic search."
+  [{:keys [embedding embedder text vector-size stage]}]
+  (let [embedded (when (and (empty? embedding) (fn? embedder) (some? text))
+                   (try (embedder text)
+                        (catch Throwable t {::failed (or (ex-message t) (str t))})))
+        v        (if (seq embedding) embedding embedded)]
+    (cond
+      (and (map? v) (::failed v))
+      {:error {:success? false :error :qdrant/embed-failed :stage stage
+               :message (::failed v)}}
+
+      (seq v)
+      (if-let [e (dim-mismatch v vector-size stage)]
+        {:error e}
+        {:vector (vec v)})
+
+      (fn? embedder)
+      {:error {:success? false :error :qdrant/embed-failed :stage stage
+               :message (if (some? text)
+                          "embedder returned no vector"
+                          "nothing to embed (entry/query carries no content)")}}
+
+      :else {:no-embedder true})))
+
 (defn- entry->point
-  "Transform an entry map into a clj-qdrant point map.
+  "Transform an entry map + its resolved vector into a clj-qdrant point map.
    Tags are stored as a native list (qdrant keyword[] payload field) so they
-   can be filtered via match-keyword conditions."
-  [{:keys [id embedding] :as entry} vector-size]
+   can be filtered via match-keyword conditions.
+
+   The vector is resolved by `resolve-vector` at the call site, so this stays
+   pure and no zero-vector fallback can hide inside it."
+  [{:keys [id] :as entry} vector]
   {:id      (->uuid-id id)
-   :vector  (or embedding (zero-vec vector-size))
+   :vector  vector
    :payload (-> entry
                 (dissoc :embedding)
                 (update :type #(if (keyword? %) (name %) (str %)))
@@ -375,15 +453,29 @@
       (resilient
        (fn []
          (if-let [c @client-atom]
-           (let [vs (:vector-size config default-vector-size)
-                 point (entry->point entry+id vs)]
-             (q-api/upsert-points c
-                                  :collection (:collection-name config default-collection)
-                                  :points [point])
-             ;; Contract: return the id string (not the {:success? true ...} map)
-             ;; — matches hive-milvus/hive-chroma so the crud write path's
-             ;; `(string? raw-id)` guard accepts the result.
-             entry-id)
+           (let [vs   (:vector-size config default-vector-size)
+                 coll (:collection-name config default-collection)
+                 rv   (resolve-vector {:embedding   (:embedding entry+id)
+                                       :embedder    (:embedder config)
+                                       :text        (->embed-text (:content entry+id))
+                                       :vector-size vs
+                                       :stage       :write})]
+             (if-let [e (:error rv)]
+               ;; A slot WITH an embedding lane that cannot embed must not
+               ;; write a placeholder — that is how 116k unrankable zero
+               ;; vectors got into carto-snippets. Fail loud; the caller's
+               ;; `(string? raw-id)` guard turns this into a visible error.
+               (do (log/warn "hive-qdrant add-entry! refused:" (:message e)
+                             {:id entry-id :collection coll})
+                   e)
+               (let [v     (or (:vector rv)
+                               (do (warn-unembedded! coll) (zero-vec vs)))
+                     point (entry->point entry+id v)]
+                 (q-api/upsert-points c :collection coll :points [point])
+                 ;; Contract: return the id string (not the {:success? true ...} map)
+                 ;; — matches hive-milvus/hive-chroma so the crud write path's
+                 ;; `(string? raw-id)` guard accepts the result.
+                 entry-id)))
            ;; fallback in-memory
            (do (swap! fallback-atom assoc-in [:entries entry-id] entry+id)
                entry-id)))
@@ -445,20 +537,60 @@
 
   ;; ---- Semantic search -----------------------------------------------------
 
-  (search-similar [_this _query-text {:keys [limit embedding] :or {limit 10}}]
+  (search-similar [_this query-text {:keys [limit embedding exclude-tags]
+                                     :or   {limit 10}
+                                     :as   opts}]
     (resilient
      (fn []
        (if-let [c @client-atom]
          (let [vs (:vector-size config default-vector-size)
-               v  (or embedding (zero-vec vs))
-               r  (q-api/search-points c
-                                       :collection (:collection-name config default-collection)
-                                       :vector v
-                                       :limit limit)]
-           {:success? true :count (:count r) :results (:results r)})
+               rv (resolve-vector {:embedding   embedding
+                                   :embedder    (:embedder config)
+                                   :text        (->embed-text query-text)
+                                   :vector-size vs
+                                   :stage       :search})]
+           (cond
+             (:error rv) (:error rv)
+
+             ;; No embedding lane => there is no semantic search on this slot.
+             ;; Saying so is the whole point: the previous zero-vector query
+             ;; returned arbitrary points at score 0.0 and reported :success?.
+             (:no-embedder rv)
+             {:success? false
+              :error    :qdrant/no-embedder
+              :count    0
+              :results  []
+              :message  (str "no embedder configured for collection "
+                             (:collection-name config default-collection)
+                             " — semantic search unavailable on this slot")}
+
+             :else
+             (let [r    (q-api/search-points
+                         c
+                         :collection (:collection-name config default-collection)
+                         :vector (:vector rv)
+                         :limit limit
+                         ;; :project-ids / :type were silently discarded before —
+                         ;; even a working vector search returned cross-project
+                         ;; hits. Same filter builder query-entries uses.
+                         :filter (q-api/->filter (build-must-keyword opts))
+                         :with-payload? true)
+                   ;; search-points hands back DECODED {:id :payload :score}
+                   ;; maps. Shaping them to entries here is what lets
+                   ;; granular/normalize-semantic take its (map? row) branch and
+                   ;; recover :qn/:tags/:content — raw ScoredPoints degraded to
+                   ;; :opaque rows that semantic-grep's (filter :qn) then dropped.
+                   rows (-> (:results r)
+                            (exclude-tagged exclude-tags)
+                            (->> (mapv (fn [p]
+                                         (assoc (point->entry p) :score (:score p))))))]
+               {:success? true :count (count rows) :results rows})))
          {:success? true :count 0 :results []}))))
 
-  (supports-semantic-search? [_this] true)
+  (supports-semantic-search? [_this]
+    ;; Honest capability: true iff a real embedder is wired. Hardcoding `true`
+    ;; while every vector was zeros is what made the broken lane look healthy.
+    (boolean (fn? (:embedder config))))
 
   ;; ---- Expiration ----------------------------------------------------------
 
