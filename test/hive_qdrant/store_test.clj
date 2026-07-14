@@ -4,7 +4,7 @@
    Runs against the in-memory fallback path — no live qdrant required.
    Live integration is gated behind the ^:integration metadata."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
-            [hive-mcp.protocols.memory :as proto]
+            [hive-spi.memory.ports :as proto]
             [hive-qdrant.circuit :as circuit]
             [hive-qdrant.queue :as q]
             [hive-qdrant.store :as store]))

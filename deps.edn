@@ -1,28 +1,51 @@
 {:paths ["src" "resources"]
+ ;; Runtime deps are Maven-native so the published POM is self-contained:
+ ;; b/write-pom SKIPS :git/tag coords, and a consumer resolving hive-qdrant by
+ ;; :mvn/version would silently miss them.
  :deps {org.clojure/clojure       {:mvn/version "1.12.0"}
         org.clojure/core.async    {:mvn/version "1.6.681"}
         com.taoensso/timbre       {:mvn/version "6.8.0"}
-        io.github.hive-agi/clj-qdrant     {:git/tag "v0.1.1" :git/sha "ad9d4bb"}
-        ;; hive-mcp protocols (IMemoryStore, IAddon) — local root for dev
-        io.github.hive-agi/hive-mcp {:git/tag "v0.16.7" :git/sha "0222203"}
+        io.github.hive-agi/clj-qdrant {:mvn/version "0.1.1"}
+
+        ;; IMemoryStore / IMemoryStoreLiveness — the SPI leaf, NOT hive-mcp.
+        ;; The core store/queue/migrate nses depend only on these ports, so the
+        ;; published jar carries no host dependency.
+        io.github.hive-agi/hive-spi {:mvn/version "0.1.4"}
 
         ;; Config DI — typed env var resolution with ADT backing
-        io.github.hive-agi/hive-di  {:git/tag "v0.3.1" :git/sha "ab63fd0"}
+        io.github.hive-agi/hive-di  {:mvn/version "0.3.1"}
         ;; Result monad used by hive-di resolve
-        io.github.hive-agi/hive-dsl {:git/tag "v0.5.2" :git/sha "8d9760c"}}
+        io.github.hive-agi/hive-dsl {:mvn/version "0.5.2"}
+
+        ;; HOST INTEGRATION ONLY — used by hive_qdrant/addon.clj and
+        ;; hive_qdrant/lifecycle.clj, which are excluded from the published jar
+        ;; (see :jar-excludes in version.edn) and dropped from the published POM
+        ;; (:pom-exclude-deps). Kept here so the addon still builds in the
+        ;; monorepo. hive-mcp is NOT on Clojars — nothing in the published core
+        ;; may require it.
+        io.github.hive-agi/hive-mcp {:git/tag "v0.16.7" :git/sha "0222203"}}
 
  :aliases
  {:dev  {:extra-paths ["dev" "test"]
          :extra-deps {nrepl/nrepl {:mvn/version "1.7.0"}
                       cider/cider-nrepl {:mvn/version "0.58.0"}
-                      io.github.hive-agi/hive-test
-                      {:git/tag "v0.3.0" :git/sha "763e4bc"}
+                      io.github.hive-agi/hive-test {:mvn/version "0.3.1"}
                       org.clojure/test.check {:mvn/version "1.1.1"}}}
   :test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
                       {:git/tag "v0.5.1" :git/sha "dfb30dd"}
                       org.clojure/test.check {:mvn/version "1.1.1"}
-                      io.github.hive-agi/hive-test
-                      {:git/tag "v0.3.0" :git/sha "763e4bc"}}
+                      io.github.hive-agi/hive-test {:mvn/version "0.3.1"}
+                      ;; Only addon_test is host-coupled; hive-mcp needs
+                      ;; hive-help on the classpath to load. Test-scope only —
+                      ;; the published core requires neither.
+                      io.github.hive-agi/hive-help {:mvn/version "0.1.0"}}
          :main-opts ["-m" "cognitect.test-runner" "-d" "test" "-e" ":integration"]
-         :exec-fn cognitect.test-runner.api/test}}}
+         :exec-fn cognitect.test-runner.api/test}
+
+  ;; Clojars publishing. `clojure -T:build <jar|install|deploy>`.
+  ;; Version = VERSION file; version.edn carries the coordinates,
+  ;; :jar-excludes (host-integration nses) and :pom-exclude-deps.
+  :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.9"}
+                 slipset/deps-deploy {:mvn/version "0.2.2"}}
+          :ns-default build}}}

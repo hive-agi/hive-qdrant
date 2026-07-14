@@ -1,0 +1,17 @@
+{:lib      io.github.hive-agi/hive-qdrant
+ :minor    1
+ :license  {:name "MIT" :url "https://opensource.org/licenses/MIT"}
+ :scm-url  "https://github.com/hive-agi/hive-qdrant"
+ :src-dirs ["src" "resources"]
+ ;; Host-integration namespaces. They require hive-mcp, which is NOT on
+ ;; Clojars, so they must not ship in the published core — a consumer
+ ;; resolving hive-qdrant by :mvn/version would hit an unresolvable require.
+ ;; Both addon manifests must go: a manifest left in the jar makes a host
+ ;; discover the addon and try to load hive_qdrant.addon, which is excluded.
+ :jar-excludes ["hive_qdrant/addon.clj"
+                "hive_qdrant/lifecycle.clj"
+                "META-INF/hive-addons/hive-qdrant.edn"
+                "META-INF/hive-addons/hive-qdrant-kanban.edn"]
+ ;; Integration-only libs whose namespaces are jar-excluded — dropped from the
+ ;; published core POM (kept in deps.edn for monorepo/addon dev).
+ :pom-exclude-deps [io.github.hive-agi/hive-mcp]}

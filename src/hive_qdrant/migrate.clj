@@ -12,13 +12,13 @@
 
      (def src-store (load-chroma-or-milvus))
      (def qdrant    (store/create-store {:host \"localhost\" :port 6334}))
-     (hive-mcp.protocols.memory/connect! qdrant {})
+     (hive-spi.memory.ports/connect! qdrant {})
 
      (mig/sync!
        {:source-fn  (fn [] (fetch-all-from src-store))
         :target     qdrant
         :batch-size 500}))"
-  (:require [hive-mcp.protocols.memory :as proto]
+  (:require [hive-spi.memory.ports :as proto]
             [taoensso.timbre :as log]))
 
 ;; =============================================================================

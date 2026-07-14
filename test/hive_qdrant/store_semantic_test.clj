@@ -17,7 +17,7 @@
    No live qdrant: the client seam is stubbed and the q-api boundary redef'd."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [clj-qdrant.api :as q-api]
-            [hive-mcp.protocols.memory :as proto]
+            [hive-spi.memory.ports :as proto]
             [hive-qdrant.circuit :as circuit]
             [hive-qdrant.queue :as q]
             [hive-qdrant.store :as store]))

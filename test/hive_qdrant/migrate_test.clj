@@ -1,7 +1,7 @@
 (ns hive-qdrant.migrate-test
   "Trifecta for migrate: golden + property + mutation."
   (:require [clojure.test :refer [deftest is testing]]
-            [hive-mcp.protocols.memory :as mem-proto]
+            [hive-spi.memory.ports :as mem-proto]
             [hive-qdrant.migrate :as mig]))
 
 (defrecord CountingStore [entries-atom]
