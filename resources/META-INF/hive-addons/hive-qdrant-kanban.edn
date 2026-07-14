@@ -1,0 +1,25 @@
+{:addon/id           "hive.qdrant.kanban"
+ :addon/kind         :library
+ :addon/type         :native
+ :addon/version      "0.1.0"
+ :addon/init-ns      "hive-qdrant.addon"
+ :addon/init-fn      "create-addon"
+ ;; Connection surface resolved via hive-di — see hive-qdrant.config/QdrantConfig.
+ ;; Env vars: QDRANT_HOST, QDRANT_PORT, QDRANT_API_KEY, QDRANT_TLS.
+ ;;
+ ;; Routing: occupies the :kanban slot of the multi-store registry —
+ ;; distinct from the :carto slot used by the carto manifest. Both
+ ;; manifests share the QdrantAddon record but register under different
+ ;; addon-ids and slots.
+ ;;
+ ;; Vector size 4096 matches the Venice/OpenRouter embedder used on the
+ ;; create path (mem-crud/handle-add). Kanban list/move/get/delete/stats
+ ;; queries hit payload indexes only (tags/type/project-id) — no vector
+ ;; distance compute on the hot path.
+ :addon/config       {:collection-name "hive_kanban"
+                      :registry-key    :kanban
+                      :vector-size     4096
+                      :distance        :cosine}
+ :addon/capabilities #{:vector-search :health-reporting}
+ :addon/dependencies #{}
+ :addon/description  "Qdrant vector DB backend for :kanban IMemoryStore slot (kanban tasks — decouples from milvus hot path)."}

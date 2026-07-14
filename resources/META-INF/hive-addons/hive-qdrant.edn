@@ -1,0 +1,24 @@
+{:addon/id           "hive.qdrant"
+ :addon/kind         :library
+ :addon/type         :native
+ :addon/version      "0.1.0"
+ :addon/init-ns      "hive-qdrant.addon"
+ :addon/init-fn      "create-addon"
+ ;; Connection surface resolved via hive-di — see hive-qdrant.config/QdrantConfig.
+ ;; Env vars: QDRANT_HOST, QDRANT_PORT, QDRANT_API_KEY, QDRANT_TLS.
+ ;; Only fields that diverge from the typed defaults need to live here.
+ ;; :registry-key explicit (was implicit default :carto). Now explicit
+ ;; so the slot is grep-visible alongside the second kanban manifest.
+ ;; :embed-type opts this slot into semantic embedding — the addon resolves the
+ ;; model per call from the :embedder registry in ~/.config/hive-mcp/config.edn
+ ;; (type :carto-snippet → default qwen3-embedding:4b, 2560d, the memory lane).
+ ;; :vector-size MUST match that model's dimension (Qdrant fixes dim per
+ ;; collection); changing the model to another dimension requires recreating
+ ;; the carto-snippets collection.
+ :addon/config       {:collection-name "carto-snippets"
+                      :registry-key    :carto
+                      :embed-type      :carto-snippet
+                      :vector-size     2560}
+ :addon/capabilities #{:vector-search :health-reporting :cartography}
+ :addon/dependencies #{}
+ :addon/description  "Qdrant vector DB backend for :carto IMemoryStore slot (cartography snippets)."}
