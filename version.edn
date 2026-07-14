@@ -6,12 +6,13 @@
  ;; Host-integration namespaces. They require hive-mcp, which is NOT on
  ;; Clojars, so they must not ship in the published core — a consumer
  ;; resolving hive-qdrant by :mvn/version would hit an unresolvable require.
- ;; Both addon manifests must go: a manifest left in the jar makes a host
- ;; discover the addon and try to load hive_qdrant.addon, which is excluded.
+ ;; The whole manifest DIRECTORY goes, not just the .edn files in it: a manifest
+ ;; left in the jar makes a host discover the addon and try to load
+ ;; hive_qdrant.addon, which is excluded. Deleting the files individually left
+ ;; an empty META-INF/hive-addons/ directory entry behind in the jar.
  :jar-excludes ["hive_qdrant/addon.clj"
                 "hive_qdrant/lifecycle.clj"
-                "META-INF/hive-addons/hive-qdrant.edn"
-                "META-INF/hive-addons/hive-qdrant-kanban.edn"]
+                "META-INF/hive-addons"]
  ;; Integration-only libs whose namespaces are jar-excluded — dropped from the
  ;; published core POM (kept in deps.edn for monorepo/addon dev).
  :pom-exclude-deps [io.github.hive-agi/hive-mcp]}

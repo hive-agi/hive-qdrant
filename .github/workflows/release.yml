@@ -84,7 +84,10 @@ jobs:
         run: |
           JAR="target/hive-qdrant-${{ steps.version.outputs.version }}.jar"
           POM="target/classes/META-INF/maven/io.github.hive-agi/hive-qdrant/pom.xml"
-          if unzip -l "$JAR" | grep -qE "hive_qdrant/(addon|lifecycle)\.clj|META-INF/hive-addons/"; then
+          # Match FILES, not the bare directory entry: b/delete can leave an
+          # empty META-INF/hive-addons/ behind, which carries no manifest and
+          # must not fail the release.
+          if unzip -l "$JAR" | grep -qE "hive_qdrant/(addon|lifecycle)\.clj|META-INF/hive-addons/.+\.edn"; then
             echo "::error::host-integration namespaces leaked into the published jar"
             unzip -l "$JAR" | grep -E "addon|lifecycle"
             exit 1
