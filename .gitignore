@@ -4,3 +4,6 @@
 target/
 .nrepl-port
 local.deps.edn
+.clj-kondo/.cache/
+.clj-kondo/imports/
+.lsp/.cache/

@@ -28,7 +28,10 @@
 (deftest golden-fallback-add-get
   (let [s (fresh-store)
         r (proto/add-entry! s {:id "e1" :type :note :content "hello"})]
-    (is (:success? r))
+    ;; add-entry! returns the id string, not a {:success? true} map — see the
+    ;; contract note on store/add-entry!. Asserting :success? here silently
+    ;; passed nil for as long as the old shape was assumed.
+    (is (= "e1" r))
     (let [fetched (proto/get-entry s "e1")]
       (is (= "hello" (:content fetched))))))
 
@@ -41,7 +44,15 @@
     (is (contains? status :queue))))
 
 (deftest golden-supports-semantic-search
-  (is (true? (proto/supports-semantic-search? (fresh-store)))))
+  (testing "capability tracks the injected embedder, not a hardcoded true"
+    ;; Was `(is (true? ...))` on a store with NO embedder — the store then
+    ;; wrote and queried zero vectors, so it advertised a semantic lane it did
+    ;; not have (kanban 20260712134504-18ceba10). See store-semantic-test.
+    (is (false? (proto/supports-semantic-search? (fresh-store)))
+        "no embedder wired -> no semantic search")
+    (is (true? (proto/supports-semantic-search?
+                (store/create-store {:collection-name "test" :vector-size 4
+                                     :embedder (fn [_] [0.1 0.2 0.3 0.4])}))))))
 
 ;; ---- Property -------------------------------------------------------------
 
