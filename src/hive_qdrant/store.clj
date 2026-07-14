@@ -5,7 +5,7 @@
    unreachable qdrant cluster degrades instead of erroring. Reads on an
    open circuit return queue/degraded-response with actionable tips.
 
-   Entry shape (from hive-mcp.protocols.memory):
+   Entry shape (from hive-spi.memory.ports):
      {:id         string (uuid or timestamp-hex)
       :type       keyword|string (e.g. :decision :note :snippet)
       :content    string
@@ -29,7 +29,7 @@
             [clojure.data.json :as json]
             [clojure.edn :as edn]
             [clojure.string :as str]
-            [hive-mcp.protocols.memory :as proto]
+            [hive-spi.memory.ports :as proto]
             [hive-qdrant.circuit :as circuit]
             [hive-qdrant.failure :as failure]
             [hive-qdrant.queue :as queue]
@@ -51,6 +51,17 @@
     (UUID/fromString id-str)
     (catch Throwable _
       (UUID/nameUUIDFromBytes (.getBytes (str id-str) "UTF-8")))))
+
+(defn- generate-id
+  "Timestamped entry id: yyyyMMddHHmmss-<8 hex>.
+
+   Defined here rather than taken from the host so the published core carries
+   no host dependency. Format is byte-identical to hive-mcp.memory.ids/generate-id
+   and hive-milvus's local copy — ids must stay interchangeable across stores."
+  []
+  (let [ts  (java.time.LocalDateTime/now)
+        fmt (java.time.format.DateTimeFormatter/ofPattern "yyyyMMddHHmmss")]
+    (str (.format ts fmt) "-" (format "%08x" (rand-int Integer/MAX_VALUE)))))
 
 (defn- zero-vec [n] (vec (repeat n 0.0)))
 
@@ -443,12 +454,12 @@
 
   (add-entry! [_this entry]
     ;; Generate a stable timestamp+hex id when the caller didn't supply
-    ;; one. Mirror's hive-milvus's behaviour (`(or (:id entry)
-    ;; (proto/generate-id))` in record/entry->record-pure). Without
-    ;; this fresh writes via hive-mcp's mem-crud get a nil id back,
-    ;; tripping the contract guard in `crud.write/do-add!`. Migration
-    ;; entries already carry ids; ad-hoc writes (kanban create) do not.
-    (let [entry-id (or (:id entry) (proto/generate-id))
+    ;; one. Mirrors hive-milvus's behaviour (`(or (:id entry)
+    ;; (generate-id))` in record/entry->record-pure). Without this,
+    ;; fresh writes via the host's mem-crud get a nil id back, tripping
+    ;; the contract guard in `crud.write/do-add!`. Migration entries
+    ;; already carry ids; ad-hoc writes (kanban create) do not.
+    (let [entry-id (or (:id entry) (generate-id))
           entry+id (assoc entry :id entry-id)]
       (resilient
        (fn []
@@ -680,9 +691,7 @@
 ;; resilience layer can drive recovery on transient transport failures
 ;; (NAT idle-timeout, ingress flap) without importing qdrant internals.
 
-(require '[hive-mcp.protocols.memory-liveness :as liveness])
-
-(extend-protocol liveness/IMemoryStoreLiveness
+(extend-protocol proto/IMemoryStoreLiveness
   QdrantMemoryStore
   (-probe! [this]
     (boolean @(:connected?-atom this)))

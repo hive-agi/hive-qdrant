@@ -10,8 +10,13 @@ permissions:
 
 jobs:
   release:
-    name: Tag & Release
+    name: Tag, Release, Deploy & Bump
     runs-on: ubuntu-latest
+    # Skip the run this workflow's own bump commit triggers.
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    env:
+      CLOJARS_USERNAME: ${{ secrets.CLOJARS_USERNAME }}
+      CLOJARS_PASSWORD: ${{ secrets.CLOJARS_DEPLOY_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,44 +26,105 @@ jobs:
       - name: Read version
         id: version
         run: |
-          if [ -f VERSION ]; then
-            VERSION=$(cat VERSION | tr -d '[:space:]')
-          else
+          if [ ! -f VERSION ]; then
             echo "::error::VERSION file not found"
             exit 1
           fi
+          VERSION=$(tr -d '[:space:]' < VERSION)
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
 
+      # Tagging and Clojars publication are gated INDEPENDENTLY. A repo can
+      # already carry its tag while never having been published, so a single
+      # tag-based gate would silently skip the deploy forever.
       - name: Check if tag exists
-        id: check_tag
+        id: tag
         run: |
-          if git rev-parse "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+          if git rev-parse "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Check if version is on Clojars
+        id: clojars
+        run: |
+          V="${{ steps.version.outputs.version }}"
+          URL="https://repo.clojars.org/io/github/hive-agi/hive-qdrant/${V}/hive-qdrant-${V}.pom"
+          if curl -sfI "$URL" -o /dev/null; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "hive-qdrant ${V} is already on Clojars — deploy skipped (releases are immutable)."
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Clojure
+        uses: DeLaGuardo/setup-clojure@12.5
+        with:
+          cli: latest
+
+      - name: Run tests
+        run: clojure -M:test
+
+      - name: Build jar
+        run: clojure -T:build jar
+
+      # The published core must never carry the host-integration namespaces:
+      # they require hive-mcp, which is NOT on Clojars, so a consumer resolving
+      # hive-qdrant by :mvn/version would hit an unresolvable require at runtime.
+      # Fail the release rather than publish an artifact that resolves cleanly
+      # and then explodes.
+      - name: Verify jar carries no host dependency
+        run: |
+          JAR="target/hive-qdrant-${{ steps.version.outputs.version }}.jar"
+          POM="target/classes/META-INF/maven/io.github.hive-agi/hive-qdrant/pom.xml"
+          if unzip -l "$JAR" | grep -qE "hive_qdrant/(addon|lifecycle)\.clj|META-INF/hive-addons/"; then
+            echo "::error::host-integration namespaces leaked into the published jar"
+            unzip -l "$JAR" | grep -E "addon|lifecycle"
+            exit 1
+          fi
+          if grep -q "hive-mcp" "$POM"; then
+            echo "::error::hive-mcp leaked into the published POM"
+            exit 1
+          fi
+          echo "jar + pom are host-free"
+
       - name: Create tag
-        if: steps.check_tag.outputs.exists == 'false'
+        if: steps.tag.outputs.exists == 'false'
         run: |
           git tag "${{ steps.version.outputs.tag }}"
           git push origin "${{ steps.version.outputs.tag }}"
 
-      - name: Check if release exists
-        id: check_release
-        run: |
-          if gh release view "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-        env:
-          GH_TOKEN: ${{ github.token }}
-
       - name: Create GitHub release
-        if: steps.check_release.outputs.exists == 'false'
+        if: steps.tag.outputs.exists == 'false'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           generate_release_notes: true
+          files: target/hive-qdrant-${{ steps.version.outputs.version }}.jar
+
+      - name: Deploy to Clojars
+        if: steps.clojars.outputs.published == 'false' && env.CLOJARS_USERNAME != ''
+        run: clojure -T:build deploy
+
+      # Bump the patch component so main always carries the NEXT, unreleased
+      # version (A.B.X -> A.B.X+1). Runs only when a release actually happened,
+      # and is marked [skip ci] so it does not re-trigger this workflow.
+      - name: Bump patch version
+        if: steps.tag.outputs.exists == 'false' || steps.clojars.outputs.published == 'false'
+        run: |
+          CUR=$(tr -d '[:space:]' < VERSION)
+          NEXT=$(echo "$CUR" | awk -F. '{ $3 = $3 + 1; print $1"."$2"."$3 }' OFS=.)
+          echo "$NEXT" > VERSION
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add VERSION
+          git commit -m "chore: bump VERSION to ${NEXT} [skip ci]"
+          git push origin HEAD:main
+          echo "released ${CUR}; main now on ${NEXT}"

@@ -10,7 +10,7 @@
    Mirrors hive-milvus.queue without the hive-weave dep — uses
    core.async bounded channel for single-writer serialization."
   (:require [clojure.core.async :as a]
-            [hive-mcp.protocols.memory :as proto]
+            [hive-spi.memory.ports :as proto]
             [taoensso.timbre :as log])
   (:import [clojure.lang PersistentQueue]))
 
