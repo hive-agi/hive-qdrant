@@ -28,7 +28,10 @@
 (deftest golden-fallback-add-get
   (let [s (fresh-store)
         r (proto/add-entry! s {:id "e1" :type :note :content "hello"})]
-    (is (:success? r))
+    ;; add-entry! returns the id string, not a {:success? true} map — see the
+    ;; contract note on store/add-entry!. Asserting :success? here silently
+    ;; passed nil for as long as the old shape was assumed.
+    (is (= "e1" r))
     (let [fetched (proto/get-entry s "e1")]
       (is (= "hello" (:content fetched))))))
 
