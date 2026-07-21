@@ -15,4 +15,4 @@
                 "META-INF/hive-addons"]
  ;; Integration-only libs whose namespaces are jar-excluded — dropped from the
  ;; published core POM (kept in deps.edn for monorepo/addon dev).
- :pom-exclude-deps [io.github.hive-agi/hive-mcp]}
+ :pom-exclude-deps [io.github.hive-agi/hive-mcp] :publish  :clojars}

@@ -12,13 +12,17 @@
  ;; manifests share the QdrantAddon record but register under different
  ;; addon-ids and slots.
  ;;
- ;; Vector size 4096 matches the Venice/OpenRouter embedder used on the
- ;; create path (mem-crud/handle-add). Kanban list/move/get/delete/stats
- ;; queries hit payload indexes only (tags/type/project-id) — no vector
- ;; distance compute on the hot path.
+ ;; :embed-type opts this slot into semantic embedding — the addon resolves
+ ;; the provider per call from the :embedder registry (default lane:
+ ;; qwen3-embedding:4b, 2560d — the shared space with memory + carto).
+ ;; :vector-size MUST match that provider's dimension (qdrant fixes dim per
+ ;; collection; hive_kanban recreated at 2560d on 2026-07-20). Kanban
+ ;; list/move/get/delete/stats queries hit payload indexes only
+ ;; (tags/type/project-id) — no vector distance compute on the hot path.
  :addon/config       {:collection-name "hive_kanban"
                       :registry-key    :kanban
-                      :vector-size     4096
+                      :embed-type      :kanban
+                      :vector-size     2560
                       :distance        :cosine}
  :addon/capabilities #{:vector-search :health-reporting}
  :addon/dependencies #{}
