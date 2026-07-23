@@ -15,7 +15,7 @@
         ;; Config DI — typed env var resolution with ADT backing
         io.github.hive-agi/hive-di  {:mvn/version "0.3.2"}
         ;; Result monad used by hive-di resolve
-        io.github.hive-agi/hive-dsl {:mvn/version "0.5.7"}
+        io.github.hive-agi/hive-dsl {:mvn/version "0.5.8"}
 
         ;; HOST INTEGRATION ONLY — used by hive_qdrant/addon.clj and
         ;; hive_qdrant/lifecycle.clj, which are excluded from the published jar
