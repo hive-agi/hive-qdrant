@@ -23,6 +23,7 @@
         ;; (:pom-exclude-deps). Kept here so the addon still builds in the
         ;; monorepo. hive-mcp is NOT on Clojars — nothing in the published core
         ;; may require it.
+        io.github.hive-agi/hive-addon {:mvn/version "0.3.3"}
         io.github.hive-agi/hive-mcp {:mvn/version "0.18.1"}}
 
  :aliases

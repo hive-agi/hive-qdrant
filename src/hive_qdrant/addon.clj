@@ -36,13 +36,13 @@
      (addons/init-addon! \"hive.qdrant\"
        {:collection-name \"carto_snippets\"})"
   (:require [hive-dsl.result :as r]
-            [hive-mcp.addons.protocol :as addon-proto]
             [hive-mcp.embeddings.protocol :as embed-proto]
             [hive-mcp.embeddings.service :as embed-svc]
             [hive-mcp.protocols.memory :as mem-proto]
             [hive-qdrant.config :as cfg]
             [hive-qdrant.store :as store]
-            [taoensso.timbre :as log]))
+            [taoensso.timbre :as log]
+            [hive-addon.protocol :as addon-proto]))
 
 (def ^:const default-registry-key
   "Default multi-store registry slot when manifest doesn't override."

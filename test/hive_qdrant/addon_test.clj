@@ -5,10 +5,10 @@
    hive-qdrant.store/create-store → always-connect stub, so registry
    registration paths are exercised without a cluster."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
-            [hive-mcp.addons.protocol :as addon-proto]
             [hive-mcp.protocols.memory :as mem-proto]
             [hive-qdrant.addon :as addon]
-            [hive-qdrant.store :as store]))
+            [hive-qdrant.store :as store]
+            [hive-addon.protocol :as addon-proto]))
 
 (use-fixtures :each
   (fn [f]
