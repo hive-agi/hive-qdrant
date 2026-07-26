@@ -36,9 +36,10 @@
      (addons/init-addon! \"hive.qdrant\"
        {:collection-name \"carto_snippets\"})"
   (:require [hive-dsl.result :as r]
-            [hive-mcp.embeddings.protocol :as embed-proto]
+            [hive-spi.embeddings.ports :as embed-proto]
             [hive-mcp.embeddings.service :as embed-svc]
-            [hive-mcp.protocols.memory :as mem-proto]
+            [hive-spi.memory.ports :as mem-proto]
+            [hive-spi.memory.registry :as mem-reg]
             [hive-qdrant.config :as cfg]
             [hive-qdrant.store :as store]
             [taoensso.timbre :as log]
@@ -123,7 +124,7 @@
               (do
                 (reset! store-atom store)
                 (reset! slot-atom slot)
-                (mem-proto/register-store! slot store)
+                (mem-reg/register-store! slot store)
                 (log/info "QdrantAddon initialized — registered under"
                           slot
                           {:host       (:host resolved)
@@ -144,7 +145,7 @@
   (shutdown! [_this]
     (when-let [store @store-atom]
       (try (mem-proto/disconnect! store) (catch Throwable _ nil))
-      (mem-proto/unregister-store! @slot-atom)
+      (mem-reg/unregister-store! @slot-atom)
       (reset! store-atom nil)
       (log/info "QdrantAddon shut down" {:slot @slot-atom :addon-id @addon-id-atom}))
     nil)
