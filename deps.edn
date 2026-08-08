@@ -47,6 +47,5 @@
   ;; Clojars publishing. `clojure -T:build <jar|install|deploy>`.
   ;; Version = VERSION file; version.edn carries the coordinates,
   ;; :jar-excludes (host-integration nses) and :pom-exclude-deps.
-  :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.9"}
-                 slipset/deps-deploy {:mvn/version "0.2.2"}}
-          :ns-default build}}}
+  :build {:deps {io.github.hive-agi/hive-build {:mvn/version "0.1.0"}}
+          :ns-default hive-build.api}}}
