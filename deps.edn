@@ -3,7 +3,7 @@
  ;; b/write-pom SKIPS :git/tag coords, and a consumer resolving hive-qdrant by
  ;; :mvn/version would silently miss them.
  :deps {org.clojure/clojure       {:mvn/version "1.12.5"}
-        org.clojure/core.async    {:mvn/version "1.6.681"}
+        org.clojure/core.async    {:mvn/version "1.9.865"}
         com.taoensso/timbre       {:mvn/version "6.8.0"}
         io.github.hive-agi/clj-qdrant {:mvn/version "0.1.2"}
 
