@@ -13,9 +13,9 @@
         io.github.hive-agi/hive-spi {:mvn/version "0.1.20"}
 
         ;; Config DI — typed env var resolution with ADT backing
-        io.github.hive-agi/hive-di  {:mvn/version "0.4.2"}
+        io.github.hive-agi/hive-di  {:mvn/version "0.4.3"}
         ;; Result monad used by hive-di resolve
-        io.github.hive-agi/hive-dsl {:mvn/version "0.5.14"}
+        io.github.hive-agi/hive-dsl {:mvn/version "0.5.15"}
 
         ;; HOST INTEGRATION ONLY — used by hive_qdrant/addon.clj and
         ;; hive_qdrant/lifecycle.clj, which are excluded from the published jar
@@ -47,5 +47,5 @@
   ;; Clojars publishing. `clojure -T:build <jar|install|deploy>`.
   ;; Version = VERSION file; version.edn carries the coordinates,
   ;; :jar-excludes (host-integration nses) and :pom-exclude-deps.
-  :build {:deps {io.github.hive-agi/hive-build {:mvn/version "0.1.8"}}
+  :build {:deps {io.github.hive-agi/hive-build {:mvn/version "0.1.9"}}
           :ns-default hive-build.api}}}
