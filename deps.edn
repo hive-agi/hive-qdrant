@@ -17,14 +17,13 @@
         ;; Result monad used by hive-di resolve
         io.github.hive-agi/hive-dsl {:mvn/version "0.5.21"}
 
-        ;; HOST INTEGRATION ONLY — used by hive_qdrant/addon.clj and
-        ;; hive_qdrant/lifecycle.clj, which are excluded from the published jar
-        ;; (see :jar-excludes in version.edn) and dropped from the published POM
-        ;; (:pom-exclude-deps). Kept here so the addon still builds in the
-        ;; monorepo. hive-mcp is NOT on Clojars — nothing in the published core
-        ;; may require it.
-        io.github.hive-agi/hive-addon {:mvn/version "0.3.10"}
-        io.github.hive-agi/hive-mcp {:mvn/version "0.21.1"}}
+        ;; IAddon contract + hive-addon.host, the soft-resolution seam the
+        ;; addon reaches the host through. hive-mcp is NOT on Clojars, so no
+        ;; namespace here may require it at load time; addon.clj resolves the
+        ;; one host service it uses through the var at call time instead.
+        ;; hive-mcp itself is therefore TEST-scope only (addon_test drives the
+        ;; wired path; the degraded path needs no host at all).
+        io.github.hive-agi/hive-addon {:mvn/version "0.3.10"}}
 
  :aliases
  {:dev  {:extra-paths ["dev" "test"]
@@ -40,6 +39,7 @@
                       ;; Only addon_test is host-coupled; hive-mcp needs
                       ;; hive-help on the classpath to load. Test-scope only —
                       ;; the published core requires neither.
+                      io.github.hive-agi/hive-mcp {:mvn/version "0.21.1"}
                       io.github.hive-agi/hive-help {:mvn/version "0.1.0"}}
          :main-opts ["-m" "cognitect.test-runner" "-d" "test" "-e" ":integration"]
          :exec-fn cognitect.test-runner.api/test}

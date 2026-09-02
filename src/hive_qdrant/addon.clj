@@ -37,13 +37,26 @@
        {:collection-name \"carto_snippets\"})"
   (:require [hive-dsl.result :as r]
             [hive-spi.embeddings.ports :as embed-proto]
-            [hive-mcp.embeddings.service :as embed-svc]
             [hive-spi.memory.ports :as mem-proto]
             [hive-spi.memory.registry :as mem-reg]
             [hive-qdrant.config :as cfg]
             [hive-qdrant.store :as store]
             [taoensso.timbre :as log]
-            [hive-addon.protocol :as addon-proto]))
+            [hive-addon.protocol :as addon-proto]
+            [hive-addon.host :as host]))
+
+;; =============================================================================
+;; Host services
+;; =============================================================================
+
+(host/defsoft resolve-provider-for-type
+  'hive-mcp.embeddings.service/resolve-provider-for-type
+  :absent (constantly nil)
+  :doc "Resolve the embedding provider registered for an embed-type.
+
+   Soft-resolved: the host owns the :embedder registry, and this addon is
+   published to maven while the host is not. Absent host, or host loaded after
+   this addon, returns nil and the embedder degrades to zero-vector writes.")
 
 (def ^:const default-registry-key
   "Default multi-store registry slot when manifest doesn't override."
@@ -81,7 +94,7 @@
     (let [etype (keyword embed-type)]
       (fn [text]
         (try
-          (when-let [provider (:provider (embed-svc/resolve-provider-for-type etype))]
+          (when-let [provider (:provider (resolve-provider-for-type etype))]
             (embed-proto/embed-text provider text))
           (catch Throwable t
             (log/debug "carto embed failed (degrading to zero-vec):" (ex-message t))
