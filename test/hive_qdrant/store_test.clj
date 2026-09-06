@@ -35,6 +35,18 @@
     (let [fetched (proto/get-entry s "e1")]
       (is (= "hello" (:content fetched))))))
 
+(deftest golden-fallback-get-entries-batch
+  ;; IMemoryStoreBatch: one call, missing ids omitted, callers index by :id.
+  (let [s (fresh-store)]
+    (proto/add-entry! s {:id "b1" :type :note :content "one"})
+    (proto/add-entry! s {:id "b2" :type :note :content "two"})
+    (is (satisfies? proto/IMemoryStoreBatch s))
+    (let [got (proto/get-entries s ["b1" "missing" "b2" "b1" nil])]
+      (is (= #{"b1" "b2"} (set (map :id got))))
+      (is (= {"b1" "one" "b2" "two"}
+             (into {} (map (juxt :id :content)) got))))
+    (is (= [] (proto/get-entries s [])))))
+
 (deftest golden-status-shape
   (let [s      (fresh-store)
         status (proto/store-status s)]

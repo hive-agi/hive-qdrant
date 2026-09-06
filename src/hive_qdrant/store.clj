@@ -670,6 +670,24 @@
           (log/warn "reset-store! recreate failed:" (ex-message t)))))
     {:success? true}))
 
+(extend-protocol proto/IMemoryStoreBatch
+  QdrantMemoryStore
+  (get-entries [this ids]
+    ;; One retrieve round-trip for the whole id list. Same decode path as
+    ;; get-entry (raw protobuf -> point->map -> point->entry); the payload's
+    ;; own :id wins over the point UUID, so callers can index by :id.
+    (let [ids (vec (distinct (remove nil? ids)))]
+      (if (empty? ids)
+        []
+        (resilient
+         (fn []
+           (if-let [c @(:client-atom this)]
+             (let [res (q-api/get-points c
+                                         :collection (:collection-name (:config this) default-collection)
+                                         :ids (mapv ->uuid-id ids))]
+               (into [] (keep #(some-> % q-api/point->map point->entry)) (:points res)))
+             (into [] (keep #(get-in @(:fallback-atom this) [:entries %])) ids))))))))
+
 ;; =============================================================================
 ;; IMemoryStoreLiveness — cross-store resilience seam
 ;; =============================================================================
