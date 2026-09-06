@@ -40,7 +40,7 @@
                       ;; hive-help on the classpath to load. Test-scope only —
                       ;; the published core requires neither.
                       io.github.hive-agi/hive-mcp {:mvn/version "1.0.0"}
-                      io.github.hive-agi/hive-help {:mvn/version "0.1.1"}}
+                      io.github.hive-agi/hive-help {:mvn/version "0.1.0"}}
          :main-opts ["-m" "cognitect.test-runner" "-d" "test" "-e" ":integration"]
          :exec-fn cognitect.test-runner.api/test}
 
