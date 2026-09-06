@@ -26,4 +26,6 @@
                       :distance        :cosine}
  :addon/capabilities #{:vector-search :health-reporting}
  :addon/dependencies #{}
- :addon/description  "Qdrant vector DB backend for :kanban IMemoryStore slot (kanban tasks — decouples from milvus hot path)."}
+ :addon/description  "Qdrant vector DB backend for :kanban IMemoryStore slot (kanban tasks — decouples from milvus hot path)."
+ :addon/maturity :stable
+ :addon/trust-class :foss}
