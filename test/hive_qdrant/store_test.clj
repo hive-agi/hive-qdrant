@@ -35,6 +35,31 @@
     (let [fetched (proto/get-entry s "e1")]
       (is (= "hello" (:content fetched))))))
 
+(deftest golden-fallback-update-metadata
+  ;; IMemoryStoreMetadataWrite: a metadata write merges onto the entry and
+  ;; never touches :content. The live path reuses the stored vector; the
+  ;; fallback path has none to reuse, so the contract it can prove is the
+  ;; merge itself plus the routing of embedding-identity fields.
+  (let [s (fresh-store)]
+    (is (satisfies? proto/IMemoryStoreMetadataWrite s))
+    (proto/add-entry! s {:id "m1" :type :snippet :content "(defn f [])"
+                         :tags ["carto" "line:5"]})
+    (testing "tags are replaced, content and type survive"
+      (let [merged (proto/update-metadata! s "m1" {:tags ["carto" "line:11"]})]
+        (is (= ["carto" "line:11"] (:tags merged)))
+        (is (= "(defn f [])" (:content merged)))
+        (let [fetched (proto/get-entry s "m1")]
+          (is (= ["carto" "line:11"] (:tags fetched)))
+          (is (= "(defn f [])" (:content fetched)))
+          (is (= :snippet (:type fetched))))))
+    (testing "an unknown id answers nil, not a minted row"
+      (is (nil? (proto/update-metadata! s "nope" {:tags ["x"]})))
+      (is (nil? (proto/get-entry s "nope"))))
+    (testing "a :content change is an embedding change and still lands (via update-entry!)"
+      (proto/update-metadata! s "m1" {:content "(defn g [])"})
+      (is (= "(defn g [])" (:content (proto/get-entry s "m1"))))
+      (is (= ["carto" "line:11"] (:tags (proto/get-entry s "m1")))))))
+
 (deftest golden-fallback-get-entries-batch
   ;; IMemoryStoreBatch: one call, missing ids omitted, callers index by :id.
   (let [s (fresh-store)]

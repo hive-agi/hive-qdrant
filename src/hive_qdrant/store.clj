@@ -733,6 +733,50 @@
 ;; Factory
 ;; =============================================================================
 
+(defn- retrieved-vector
+  "The stored vector of a raw RetrievedPoint as a float vector, or nil when
+   the point carries none. Reflective on purpose: the java client's
+   VectorsOutput shape has moved between releases, and a nil here routes the
+   caller to the re-embedding path rather than to a wrong write."
+  [point]
+  (try
+    (some-> point .getVectors .getVector .getDataList vec not-empty)
+    (catch Throwable _ nil)))
+
+(extend-protocol proto/IMemoryStoreMetadataWrite
+  QdrantMemoryStore
+  (update-metadata! [this id updates]
+    ;; A metadata write must not re-run the embedder: read the point WITH its
+    ;; vector, merge onto the RAW payload (never the decoded entry, whose
+    ;; :content has been parsed and would be written back reshaped), and
+    ;; upsert the same vector. :content or :type in `updates` changes the
+    ;; embedding identity, so those go through update-entry!, which embeds.
+    (if (or (contains? updates :content) (contains? updates :type))
+      (proto/update-entry! this id updates)
+      (let [client-atom   (:client-atom this)
+            fallback-atom (:fallback-atom this)
+            config        (:config this)]
+        (resilient
+         (fn []
+           (if-let [c @client-atom]
+             (let [coll (:collection-name config default-collection)
+                   res  (q-api/get-points c :collection coll :ids [(->uuid-id id)])
+                   rp   (first (:points res))
+                   v    (some-> rp retrieved-vector)]
+               (when rp
+                 (if v
+                   (let [payload (:payload (q-api/point->map rp))
+                         merged  (merge payload updates {:id id})]
+                     (q-api/upsert-points c :collection coll
+                                          :points [(entry->point merged v)])
+                     merged)
+                   ;; No vector came back: the honest write is the embedding one.
+                   (proto/update-entry! this id updates))))
+             (when-let [existing (get-in @fallback-atom [:entries id])]
+               (let [merged (merge existing updates {:id id})]
+                 (swap! fallback-atom assoc-in [:entries id] merged)
+                 merged)))))))))
+
 (defn create-store
   "Construct a QdrantMemoryStore. Does NOT open a connection —
    call (proto/connect! store cfg) to activate."
