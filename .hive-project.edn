@@ -1,0 +1,6 @@
+{:project-id "hive-qdrant"
+ :parent "hive"
+ :description "Qdrant memory-store IAddon over clj-qdrant — store, write queue, circuit breaker, failure policy, collection migration and lifecycle."
+ :language :clojure
+ :tags ["addon" "qdrant" "memory-store" "vector-db" "circuit-breaker"]
+ :carto {:source-roots ["resources" "src" "test"]}}
