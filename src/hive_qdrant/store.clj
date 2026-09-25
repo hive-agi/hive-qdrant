@@ -17,8 +17,11 @@
 
    The entry is stored as:
      - qdrant point id = (uuid from :id when uuid-shaped, else hash)
-     - vector          = :embedding or zero-vector fallback
-     - payload         = flattened entry sans :embedding
+     - vector          = :embedding, else the embedder over :embed-text when
+                         given, else over :content; zero-vector fallback only
+                         for a slot with no embedder
+     - payload         = flattened entry sans :embedding and :embed-text
+                         (the latter is transient: see `capabilities`)
 
    Collection name resolves from config :collection-name, default
    \"hive_qdrant_memory\". When not connected, an in-memory fallback atom
@@ -74,6 +77,34 @@
     (nil? content)    nil
     (string? content) (when-not (str/blank? content) content)
     :else             (pr-str content)))
+
+(def capabilities
+  "What callers may rely on beyond the IMemoryStore port, declared under
+   :capabilities in store-status (the hive-spi.memory.decorate contract).
+
+   :embed-text  an entry's transient :embed-text is embedded in place of its
+                :content, and is never persisted: not to a point payload, not
+                to the in-memory fallback. A decorator that changes :content
+                at rest (hive-knowledge's seal encrypts it) hands the store the
+                text it may index this way; without it the collection would
+                index ciphertext."
+  [:embed-text])
+
+(defn- entry-embed-text
+  "The text to embed for `entry`: its transient :embed-text when the caller
+   gave a string one, else its :content (see `->embed-text`). A given
+   :embed-text is never traded for :content, not even a blank one: under a
+   sealing decorator :content is ciphertext, and indexing it is what the
+   :embed-text capability exists to prevent."
+  [entry]
+  (let [embed-text (:embed-text entry)]
+    (->embed-text (if (string? embed-text) embed-text (:content entry)))))
+
+(defn- strip-transient
+  "`entry` without its transient keys. :embed-text is embedding input only;
+   storing it would put back the plaintext a sealing decorator encrypted."
+  [entry]
+  (dissoc entry :embed-text))
 
 (defn- dim-mismatch
   "Guard: qdrant fixes the vector width per collection. A vector of the wrong
@@ -146,11 +177,15 @@
    can be filtered via match-keyword conditions.
 
    The vector is resolved by `resolve-vector` at the call site, so this stays
-   pure and no zero-vector fallback can hide inside it."
+   pure and no zero-vector fallback can hide inside it.
+
+   Every write that reaches qdrant builds its point here, so this is where the
+   transient :embed-text is dropped: it is never part of a payload."
   [{:keys [id] :as entry} vector]
   {:id      (->uuid-id id)
    :vector  vector
    :payload (-> entry
+                strip-transient
                 (dissoc :embedding)
                 (update :type #(if (keyword? %) (name %) (str %)))
                 (update :tags #(when (seq %) (mapv str %)))
@@ -199,9 +234,13 @@
 
    Tolerates nil/absent :content — callers (e.g. query-entries with payload
    projection) may request a subset of payload fields that excludes :content,
-   in which case the returned entry simply has no :content key."
+   in which case the returned entry simply has no :content key.
+
+   A point written before this store honoured :embed-text may still carry
+   one in its payload; it is dropped here, so no read surfaces it and no
+   read-merge-write (update-entry!) embeds it in place of new content."
   [{:keys [id payload]}]
-  (let [base (or payload {})
+  (let [base (strip-transient (or payload {}))
         with-id (cond-> base
                   (and id (not (:id base))) (assoc :id id))]
     (if (contains? with-id :content)
@@ -459,6 +498,10 @@
     ;; fresh writes via the host's mem-crud get a nil id back, tripping
     ;; the contract guard in `crud.write/do-add!`. Migration entries
     ;; already carry ids; ad-hoc writes (kanban create) do not.
+    ;;
+    ;; :embed-text (the `capabilities` contract): a string one is embedded
+    ;; in place of :content, and neither the point payload nor the fallback
+    ;; ever stores it.
     (let [entry-id (or (:id entry) (generate-id))
           entry+id (assoc entry :id entry-id)]
       (resilient
@@ -468,7 +511,7 @@
                  coll (:collection-name config default-collection)
                  rv   (resolve-vector {:embedding   (:embedding entry+id)
                                        :embedder    (:embedder config)
-                                       :text        (->embed-text (:content entry+id))
+                                       :text        (entry-embed-text entry+id)
                                        :vector-size vs
                                        :stage       :write})]
              (if-let [e (:error rv)]
@@ -487,9 +530,12 @@
                  ;; — matches hive-milvus/hive-chroma so the crud write path's
                  ;; `(string? raw-id)` guard accepts the result.
                  entry-id)))
-           ;; fallback in-memory
-           (do (swap! fallback-atom assoc-in [:entries entry-id] entry+id)
+           ;; fallback in-memory: the entry, never its :embed-text
+           (do (swap! fallback-atom assoc-in [:entries entry-id] (strip-transient entry+id))
                entry-id)))
+       ;; The queued op keeps :embed-text. The queue lives in RAM only, and
+       ;; its replay runs back through add-entry!, which must embed that text
+       ;; and not the (possibly sealed) :content.
        {:op :add-entry! :id entry-id :args [entry+id]})))
 
   (get-entry [_this id]
@@ -511,6 +557,10 @@
          (get-in @fallback-atom [:entries id])))))
 
   (update-entry! [this id updates]
+    ;; A transient :embed-text in `updates` rides the merge into add-entry!,
+    ;; which embeds it in place of :content and never stores it. `existing`
+    ;; carries none (reads drop it), so updates without one embed :content
+    ;; exactly as before: the new :content when given, else the stored one.
     (let [existing (proto/get-entry this id)
           merged   (merge existing updates {:id id})]
       (proto/add-entry! this merged)))
@@ -656,7 +706,8 @@
      :collection-name (:collection-name config default-collection)
      :vector-size     (:vector-size config default-vector-size)
      :circuit         (:state (circuit/state))
-     :queue           (queue/stats)})
+     :queue           (queue/stats)
+     :capabilities    capabilities})
 
   (reset-store! [_this]
     (reset! fallback-atom (empty-fallback))
@@ -750,8 +801,16 @@
     ;; vector, merge onto the RAW payload (never the decoded entry, whose
     ;; :content has been parsed and would be written back reshaped), and
     ;; upsert the same vector. :content or :type in `updates` changes the
-    ;; embedding identity, so those go through update-entry!, which embeds.
-    (if (or (contains? updates :content) (contains? updates :type))
+    ;; embedding identity, and an :embed-text asks for a new vector, so those
+    ;; go through update-entry!, which embeds.
+    ;;
+    ;; Both re-embedding exits (those fields, or a point whose vector did not
+    ;; decode) embed a transient :embed-text in `updates` when one is given.
+    ;; Without one they embed the stored :content: this method cannot see the
+    ;; text a sealing decorator would supply, and hive-knowledge's seal drops
+    ;; :embed-text from metadata writes, so a sealed caller must send :content
+    ;; and :type changes through update-entry!, where it supplies one.
+    (if (some #(contains? updates %) [:content :type :embed-text])
       (proto/update-entry! this id updates)
       (let [client-atom   (:client-atom this)
             fallback-atom (:fallback-atom this)
@@ -765,8 +824,10 @@
                    v    (some-> rp retrieved-vector)]
                (when rp
                  (if v
+                   ;; The raw payload of a point written before :embed-text was
+                   ;; honoured may carry one; the merge drops it.
                    (let [payload (:payload (q-api/point->map rp))
-                         merged  (merge payload updates {:id id})]
+                         merged  (strip-transient (merge payload updates {:id id}))]
                      (q-api/upsert-points c :collection coll
                                           :points [(entry->point merged v)])
                      merged)
