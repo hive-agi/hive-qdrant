@@ -74,6 +74,27 @@
     (is (= 1 (count out)))
     (is (= 99 (-> out first :args second :v)))))
 
+(deftest golden-coalesce-folds-partial-updates-to-one-id
+  (testing "an update carries only its own fields: keeping the latest would drop the rest"
+    (let [out (q/coalesce [{:op :update-entry! :id "k" :args ["k" {:tags ["a"] :v 1}]}
+                           {:op :add-entry! :id "j" :args [{:id "j"}]}
+                           {:op :update-entry! :id "k" :args ["k" {:duration "long" :v 2}]}])]
+      (is (= [["k" {:tags ["a"] :duration "long" :v 2}] [{:id "j"}]]
+             (mapv :args out))
+          "one op per id, in first-seen order, the later field winning"))))
+
+(deftest golden-coalesce-retires-an-embed-text-its-content-replaced
+  (let [fold (fn [u1 u2]
+               (-> (q/coalesce [{:op :update-entry! :id "k" :args ["k" u1]}
+                                {:op :update-entry! :id "k" :args ["k" u2]}])
+                   first :args second))]
+    (is (= {:content "B"} (fold {:content "A" :embed-text "a"} {:content "B"}))
+        "run in turn, the second update would embed its own :content")
+    (is (= {:content "B" :embed-text "b"}
+           (fold {:content "A" :embed-text "a"} {:content "B" :embed-text "b"})))
+    (is (= {:content "A" :embed-text "a" :tags ["t"]}
+           (fold {:content "A" :embed-text "a"} {:tags ["t"]})))))
+
 (deftest mutation-clear-resets-depth
   (q/enqueue! {:op :add-entry! :id "z" :args [{}]})
   (is (pos? (q/size)))

@@ -49,13 +49,15 @@
     [seen (fn [text] (swap! seen conj text) (text->vector text))]))
 
 (defn- live-store
-  "A store on its LIVE branch over a fresh fake client. Returns [store client]."
+  "A store on its LIVE branch over a fresh fake client. Returns [store client].
+   CLIENT-OPTS go to fake/client ({:vector-field :data}: a pre-dense server)."
   ([] (live-store {}))
-  ([extra]
+  ([extra] (live-store extra {}))
+  ([extra client-opts]
    (let [s (store/create-store (merge {:collection-name "test-embed-text"
                                        :vector-size     vsize}
                                       extra))
-         c (fake/client)]
+         c (fake/client client-opts)]
      (reset! (:client-atom s) {:client c})
      (reset! (:connected?-atom s) true)
      [s c])))
@@ -196,6 +198,110 @@
       (is (= ["zz"] @seen))
       (is (= (text->vector "zz") (fake/point-vector c "m1")))
       (is (not (contains? (fake/payload c "m1") :embed-text))))))
+
+(defn- retrieved-vector-of
+  "store/retrieved-vector over a RetrievedPoint whose vectors output is VO."
+  [vo]
+  (#'store/retrieved-vector
+   (fake/retrieved-point (#'q-api/->point {:id     (str (java.util.UUID/randomUUID))
+                                           :vector [0.0 0.0 0.0 0.0]})
+                         vo)))
+
+(deftest retrieved-vector-reads-dense-first-then-data
+  (testing "qdrant 1.17 answers a retrieve on `dense`, the `data` field empty"
+    (is (= [1.0 2.0 3.0 4.0] (retrieved-vector-of (fake/vector-output :dense [1 2 3 4])))
+        "reading `data` alone found nothing here, and every metadata write re-embedded"))
+  (testing "a server that still fills the deprecated `data` field"
+    (is (= [1.0 2.0 3.0 4.0] (retrieved-vector-of (fake/vector-output :data [1 2 3 4])))))
+  (testing "no vector at all: nil, which routes to the embedding path"
+    (is (nil? (retrieved-vector-of nil)))
+    (is (nil? (retrieved-vector-of (fake/vector-output :dense []))))))
+
+(deftest update-metadata-finds-the-stored-vector-on-either-field
+  (doseq [field [:dense :data]]
+    (testing (str "retrieved vectors on the " (name field) " field")
+      (let [[seen embedder] (recording-embedder)
+            [s c]           (live-store {:embedder embedder} {:vector-field field})]
+        (proto/add-entry! s {:id "m1" :type :note :content "CIPHERTEXT"
+                             :embed-text "zzzz" :tags ["t"]})
+        (reset! seen [])
+        (let [merged (proto/update-metadata! s "m1" {:tags ["x"]})]
+          (is (empty? @seen) "the stored vector was found: nothing is re-embedded")
+          (is (= ["x"] (:tags merged))))
+        (is (= (text->vector "zzzz") (fake/point-vector c "m1")))
+        (is (= "CIPHERTEXT" (:content (fake/payload c "m1"))))
+        (is (= ["x"] (:tags (fake/payload c "m1"))))))))
+
+(deftest update-metadata-type-change-keeps-the-vector
+  (testing "the vector is a function of the embed text alone; :type is metadata"
+    (let [[seen embedder] (recording-embedder)
+          [s c]           (live-store {:embedder embedder})]
+      (proto/add-entry! s {:id "t1" :type :note :content "CIPHERTEXT" :embed-text "zzzz"})
+      (reset! seen [])
+      (proto/update-metadata! s "t1" {:type :decision})
+      (is (empty? @seen) "re-embedding a :type change would index the sealed :content")
+      (is (= (text->vector "zzzz") (fake/point-vector c "t1")))
+      (is (= "decision" (:type (fake/payload c "t1"))))
+      (is (= "CIPHERTEXT" (:content (fake/payload c "t1"))))
+      (testing "a non-string :embed-text asks for no new vector and is not stored"
+        (proto/update-metadata! s "t1" {:tags ["y"] :embed-text 42})
+        (is (empty? @seen))
+        (is (= (text->vector "zzzz") (fake/point-vector c "t1")))
+        (is (= ["y"] (:tags (fake/payload c "t1"))))
+        (is (not (contains? (fake/payload c "t1") :embed-text))))
+      (testing ":content still changes the vector"
+        (proto/update-metadata! s "t1" {:content "aa"})
+        (is (= ["aa"] @seen))
+        (is (= (text->vector "aa") (fake/point-vector c "t1")))
+        (is (= "decision" (:type (fake/payload c "t1"))))))))
+
+;; =============================================================================
+;; Every spelling of the key that lands in the "embed-text" payload field
+;; =============================================================================
+
+(def ^:private other-embed-text-keys
+  "Keys clj-qdrant's ->payload writes to the field \"embed-text\" (it names
+   every key with `name`), other than the unqualified :embed-text."
+  ["embed-text" :x/embed-text :hive-knowledge.seal/embed-text 'embed-text])
+
+(defn- names-embed-text? [m]
+  (boolean (some #(= "embed-text" (name %)) (keys m))))
+
+(deftest no-spelling-of-embed-text-reaches-a-payload
+  (doseq [k other-embed-text-keys]
+    (testing (pr-str k)
+      (let [[seen embedder] (recording-embedder)
+            [s c]           (live-store {:embedder embedder})]
+        (testing "add-entry!"
+          (proto/add-entry! s {:id "s1" :type :note :content "aaaa" k "plain"})
+          (is (not (contains? (fake/payload c "s1") :embed-text)))
+          (is (= ["aaaa"] @seen) "only the unqualified :embed-text is embedding input"))
+        (testing "update-entry!"
+          (proto/update-entry! s "s1" {:tags ["u"] k "plain"})
+          (is (not (contains? (fake/payload c "s1") :embed-text)))
+          (is (= ["u"] (:tags (fake/payload c "s1")))))
+        (testing "update-metadata!: the key is dropped, the vector kept"
+          (reset! seen [])
+          (proto/update-metadata! s "s1" {:tags ["m"] k "plain"})
+          (is (empty? @seen))
+          (is (not (contains? (fake/payload c "s1") :embed-text)))
+          (is (= ["m"] (:tags (fake/payload c "s1")))))
+        (testing "no read surfaces it"
+          (is (not (names-embed-text? (proto/get-entry s "s1")))))))))
+
+(deftest no-spelling-of-embed-text-reaches-the-fallback
+  (doseq [k other-embed-text-keys]
+    (testing (pr-str k)
+      (let [s      (store/create-store {:vector-size vsize})
+            stored #(get-in @(:fallback-atom s) [:entries "f1"])]
+        (proto/add-entry! s {:id "f1" :type :note :content "CIPHERTEXT" k "plain"})
+        (is (not (names-embed-text? (stored))) "add-entry!")
+        (proto/update-entry! s "f1" {:tags ["u"] k "plain"})
+        (is (not (names-embed-text? (stored))) "update-entry!")
+        (proto/update-metadata! s "f1" {:tags ["m"] k "plain"})
+        (is (not (names-embed-text? (stored))) "update-metadata!")
+        (is (= "CIPHERTEXT" (:content (stored))))
+        (is (= ["m"] (:tags (stored))))))))
 
 ;; =============================================================================
 ;; Queue replay

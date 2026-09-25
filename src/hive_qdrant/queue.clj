@@ -5,7 +5,8 @@
    When the circuit breaker opens, mutating protocol calls enqueue here
    instead of failing; reads return a degraded response. On :closed
    transition, drain! flushes the queue via a single-writer core.async
-   pipeline, coalescing by (op,id) to keep only the latest mutation.
+   pipeline, coalescing by (op,id) to keep only the latest mutation (the
+   partial :update-entry! ops for one id fold into one merge instead).
 
    Mirrors hive-milvus.queue without the hive-weave dep — uses
    core.async bounded channel for single-writer serialization."
@@ -124,8 +125,34 @@
     [(:op op) id]
     [:singleton (:op op)]))
 
+(defn- fold-updates
+  "Two queued update-entry! UPDATES maps for one id, U1 then U2, as the one
+   map that applies both. A later :content with no :embed-text of its own
+   retires the earlier :embed-text, which described the content it replaces:
+   run in turn, U2 would have embedded its own :content, not U1's text."
+  [u1 u2]
+  (merge (if (and (contains? u2 :content) (not (contains? u2 :embed-text)))
+           (dissoc u1 :embed-text)
+           u1)
+         u2))
+
+(defn- fold-op
+  "The op that stands for PREV followed by OP under one coalesce key. An
+   :add-entry! or :delete-entry! carries its whole outcome, so the latest
+   wins. An :update-entry! carries only the fields it changes (the store
+   queues the updates alone and merges them onto the real entry at replay),
+   so keeping just the latest would drop the earlier ones: they fold into
+   one merge instead."
+  [prev op]
+  (if (and prev (= :update-entry! (:op prev) (:op op)))
+    (let [[id u1] (:args prev)
+          [_ u2]  (:args op)]
+      (assoc op :args [id (fold-updates u1 u2)]))
+    op))
+
 (defn coalesce
-  "Reduce ops to the latest mutation per (op, id), preserving first-seen order."
+  "Reduce ops to one mutation per (op, id), preserving first-seen order:
+   the latest one, or for :update-entry! the fold of all of them (`fold-op`)."
   [ops]
   (let [indexed    (map-indexed vector ops)
         first-seen (persistent!
@@ -135,7 +162,9 @@
                             (transient {})
                             indexed))
         latest     (persistent!
-                    (reduce (fn [m op] (assoc! m (coalesce-key op) op))
+                    (reduce (fn [m op]
+                              (let [k (coalesce-key op)]
+                                (assoc! m k (fold-op (get m k) op))))
                             (transient {})
                             ops))]
     (->> (vals latest)
