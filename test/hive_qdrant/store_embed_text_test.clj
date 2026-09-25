@@ -12,7 +12,8 @@
    through the store config, and the client is hive-qdrant.fake-qdrant, which
    keeps the points the store upserts, so the tests read the payload that
    would have gone over the wire."
-  (:require [clojure.test :refer [deftest is testing use-fixtures]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing use-fixtures]]
             [clj-qdrant.api :as q-api]
             [hive-spi.memory.conformance :as conformance]
             [hive-spi.memory.decorate :as decorate]
@@ -302,6 +303,89 @@
         (is (not (names-embed-text? (stored))) "update-metadata!")
         (is (= "CIPHERTEXT" (:content (stored))))
         (is (= ["m"] (:tags (stored))))))))
+
+;; =============================================================================
+;; A key named embed-text below the top level
+;; =============================================================================
+
+(def ^:private nested-plaintext
+  "Fields hiding a key named embed-text below the top level, one spelling
+   each. clj-qdrant's ->value writes a map or set value as its `str` and a
+   sequence element by element, so each would put \"PLAIN\" inside a payload
+   string."
+  {:metadata {:embed-text "PLAIN" :keep "meta"}
+   :refs     [{"embed-text" "PLAIN" :keep "ref"} "r2"]
+   :marks    #{{:x/embed-text "PLAIN"}}
+   :deep     {:a {:b [{'embed-text "PLAIN"}]}}})
+
+(defn- leaks-plaintext? [x]
+  (str/includes? (pr-str x) "PLAIN"))
+
+(deftest strip-transient-reaches-every-depth
+  (let [strip #'store/strip-transient]
+    (is (= {:a {:b [{:c 1} "s"] :d #{{}}} :e [{:f 2}] :content {:body "C"}}
+           (strip {:embed-text "x"
+                   :a          {:b [{:c 1 "embed-text" "x"} "s"] :d #{{:y/embed-text "x"}}}
+                   :e          (list {:f 2 'embed-text "x"})
+                   :content    {:body "C" :embed-text "x"}})))
+    (let [v (mapv double (range 384))]
+      (is (identical? v (strip v)) "a vector holding no collection is not rebuilt"))
+    (let [m {:id "e" :content "c" :tags ["t"] :embedding [0.1 0.2]}]
+      (is (identical? m (strip m)) "a map with nothing to drop comes back as is"))))
+
+(deftest no-nested-embed-text-reaches-a-payload
+  (let [[seen embedder] (recording-embedder)
+        [s c]           (live-store {:embedder embedder})]
+    (testing "add-entry!: nested in :content and in the other fields"
+      (proto/add-entry! s (merge {:id "n1" :type :note
+                                  :content {:body "CIPHER" :embed-text "PLAIN"}}
+                                 nested-plaintext))
+      (is (not (leaks-plaintext? (fake/payload c "n1"))))
+      (is (= (str {:keep "meta"}) (:metadata (fake/payload c "n1")))
+          "the keys that are not transient stay")
+      (is (= [(pr-str {:body "CIPHER"})] @seen)
+          ":content is embedded as it is stored, the nested key dropped"))
+    (testing "update-entry!"
+      (proto/update-entry! s "n1" (merge {:content {:body "CIPHER-2" :embed-text "PLAIN"}}
+                                         nested-plaintext))
+      (is (not (leaks-plaintext? (fake/payload c "n1"))))
+      (is (not-any? #(str/includes? % "PLAIN") @seen)))
+    (testing "update-metadata!: the vector is kept, the nested keys dropped"
+      (reset! seen [])
+      (proto/update-metadata! s "n1" nested-plaintext)
+      (is (empty? @seen))
+      (is (not (leaks-plaintext? (fake/payload c "n1")))))
+    (testing "no read surfaces it"
+      (is (not (leaks-plaintext? (proto/get-entry s "n1")))))))
+
+(deftest no-nested-embed-text-reaches-the-fallback
+  (let [s      (store/create-store {:vector-size vsize})
+        stored #(get-in @(:fallback-atom s) [:entries "f1"])]
+    (proto/add-entry! s (merge {:id "f1" :type :note
+                                :content {:body "C" :embed-text "PLAIN"}}
+                               nested-plaintext))
+    (is (not (leaks-plaintext? (stored))) "add-entry!")
+    (is (= {:keep "meta"} (:metadata (stored))) "the keys that are not transient stay")
+    (proto/update-entry! s "f1" nested-plaintext)
+    (is (not (leaks-plaintext? (stored))) "update-entry!")
+    (proto/update-metadata! s "f1" nested-plaintext)
+    (is (not (leaks-plaintext? (stored))) "update-metadata!")))
+
+(deftest a-leaked-nested-embed-text-is-dropped-on-read
+  (testing "a stored point whose serialized :content carries a key named embed-text"
+    (let [[seen embedder] (recording-embedder)
+          [s c]           (live-store {:embedder embedder})]
+      (q-api/upsert-points {:client c} :collection "test-embed-text"
+                           :points [{:id      (str (java.util.UUID/nameUUIDFromBytes
+                                                    (.getBytes "old2" "UTF-8")))
+                                     :vector  [0.0 1.0 1.0 0.0]
+                                     :payload {:id "old2" :type "note"
+                                               :content (pr-str {:body "C" :embed-text "PLAIN"})}}])
+      (is (= {:body "C"} (:content (proto/get-entry s "old2")))
+          ":content is parsed, then stripped")
+      (proto/update-entry! s "old2" {:tags ["t"]})
+      (is (not-any? #(str/includes? % "PLAIN") @seen) "the rewrite embeds none of it")
+      (is (not (leaks-plaintext? (fake/payload c "old2"))) "and stores none of it"))))
 
 ;; =============================================================================
 ;; Queue replay

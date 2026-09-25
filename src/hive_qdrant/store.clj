@@ -20,8 +20,9 @@
      - vector          = :embedding, else the embedder over :embed-text when
                          given, else over :content; zero-vector fallback only
                          for a slot with no embedder
-     - payload         = flattened entry sans :embedding and :embed-text
-                         (the latter is transient: see `capabilities`)
+     - payload         = flattened entry sans :embedding and every key named
+                         embed-text, at any depth (transient: see
+                         `capabilities`)
 
    Collection name resolves from config :collection-name, default
    \"hive_qdrant_memory\". When not connected, an in-memory fallback atom
@@ -90,33 +91,62 @@
                 index ciphertext."
   [:embed-text])
 
-(defn- entry-embed-text
-  "The text to embed for `entry`: its transient :embed-text when the caller
-   gave a string one, else its :content (see `->embed-text`). A given
-   :embed-text is never traded for :content, not even a blank one: under a
-   sealing decorator :content is ciphertext, and indexing it is what the
-   :embed-text capability exists to prevent."
-  [entry]
-  (let [embed-text (:embed-text entry)]
-    (->embed-text (if (string? embed-text) embed-text (:content entry)))))
-
 (defn- transient-key?
-  "True for a key that lands in the payload field \"embed-text\".
-   clj-qdrant's ->payload writes every key as `(name k)`, so a string
-   \"embed-text\", a symbol, or a keyword in ANY namespace (:x/embed-text)
-   reaches the same field the unqualified :embed-text would."
+  "True for a key that lands in the payload field \"embed-text\", or in a
+   payload string as a key named embed-text. clj-qdrant's ->payload writes
+   every key as `(name k)`, so a string \"embed-text\", a symbol, or a keyword
+   in ANY namespace (:x/embed-text) reaches the same field the unqualified
+   :embed-text would."
   [k]
   (and (or (keyword? k) (string? k) (symbol? k))
        (= "embed-text" (name k))))
 
 (defn- strip-transient
-  "`entry` without its transient keys: every key `transient-key?` names.
+  "X without its transient keys, at every depth: each key `transient-key?`
+   names is dropped from X when X is a map, and from every map nested in X,
+   through maps, sequences and sets alike.
+
    :embed-text is embedding input only; storing it, under whatever spelling
    of the key, would put back the plaintext a sealing decorator encrypted.
-   Only the unqualified :embed-text is read as embedding input (see
-   `entry-embed-text`); the other spellings are dropped, never embedded."
+   Depth matters because clj-qdrant's ->value writes a map or set value as
+   its `str`, and a sequence element by element: {:metadata {:embed-text ..}}
+   or {:content {:embed-text ..}} would put the plaintext inside a payload
+   string. Only the top-level unqualified :embed-text is read as embedding
+   input (see `entry-embed-text`); every other one is dropped, never
+   embedded.
+
+   A map with nothing to drop comes back identical, and a collection holding
+   no collection is not walked, so an :embedding vector is never rebuilt."
+  [x]
+  (cond
+    (map? x)
+    (reduce-kv (fn [m k v]
+                 (if (transient-key? k)
+                   (dissoc m k)
+                   (let [v' (strip-transient v)]
+                     (if (identical? v v') m (assoc m k v')))))
+               x x)
+
+    (and (coll? x) (some coll? x))
+    (cond
+      (vector? x) (mapv strip-transient x)
+      (set? x)    (into (empty x) (map strip-transient) x)
+      :else       (apply list (map strip-transient x)))
+
+    :else x))
+
+(defn- entry-embed-text
+  "The text to embed for `entry`: its transient :embed-text when the caller
+   gave a string one, else its :content as it is stored, transient keys
+   stripped (see `->embed-text`, `strip-transient`). A given :embed-text is
+   never traded for :content, not even a blank one: under a sealing
+   decorator :content is ciphertext, and indexing it is what the :embed-text
+   capability exists to prevent."
   [entry]
-  (reduce-kv (fn [m k _] (if (transient-key? k) (dissoc m k) m)) entry entry))
+  (let [embed-text (:embed-text entry)]
+    (->embed-text (if (string? embed-text)
+                    embed-text
+                    (strip-transient (:content entry))))))
 
 (defn- dim-mismatch
   "Guard: qdrant fixes the vector width per collection. A vector of the wrong
@@ -249,15 +279,18 @@
    in which case the returned entry simply has no :content key.
 
    A point written before this store honoured :embed-text may still carry
-   one in its payload; it is dropped here, so no read surfaces it and no
-   read-merge-write (update-entry!) embeds it in place of new content."
+   one in its payload, top-level or inside a serialized :content; it is
+   dropped here, after :content is parsed so the strip reaches into it, so
+   no read surfaces it and no read-merge-write (update-entry!) embeds or
+   stores it again."
   [{:keys [id payload]}]
-  (let [base (strip-transient (or payload {}))
+  (let [base    (or payload {})
         with-id (cond-> base
                   (and id (not (:id base))) (assoc :id id))]
-    (if (contains? with-id :content)
-      (update with-id :content parse-content)
-      with-id)))
+    (strip-transient
+     (if (contains? with-id :content)
+       (update with-id :content parse-content)
+       with-id))))
 
 (defn- apply-order-by
   "Sort `entries` by `order-by` tuple `[field direction]`. `field` is a
@@ -583,11 +616,11 @@
     ;; and queueing the result made the replay overwrite the entry with that
     ;; map, its :content and :tags lost. So an entry that cannot be read now
     ;; queues the UPDATES ALONE: the replay runs update-entry! again, reads
-    ;; the real entry, and merges there (queue/coalesce folds successive
-    ;; updates to one id into one). A failure that will not heal (fatal,
-    ;; :reconnecting? false) comes back as is, nothing queued. An unknown id
-    ;; answers nil, as the SPI stub and hive-milvus do: nothing is minted
-    ;; from the updates alone.
+    ;; the real entry, and merges there (queue/coalesce folds it, in queue
+    ;; order, with every other op on the id). A failure that will not heal
+    ;; (fatal, :reconnecting? false) comes back as is, nothing queued. An
+    ;; unknown id answers nil, as the SPI stub and hive-milvus do: nothing is
+    ;; minted from the updates alone.
     ;;
     ;; A transient :embed-text in `updates` rides the merge into add-entry!,
     ;; which embeds it in place of :content and never stores it. `existing`

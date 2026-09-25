@@ -136,6 +136,23 @@
       (createCollectionAsync [_ _] (boom))
       (deleteCollectionAsync [_ _] (boom)))))
 
+(defn flaky-upserts
+  "A client over the fake C whose upserts throw an exception with MESSAGE
+   while the atom FAILING? holds true; every other call, reads included,
+   reaches C. Read stored points back through C itself."
+  [^FakeQdrant c failing? message]
+  (reify IFakeQdrant
+    (upsertAsync [_ collection pts]
+      (if @failing?
+        (throw (RuntimeException. ^String message))
+        (.upsertAsync c collection pts)))
+    (retrieveAsync [_ collection ids with-payload with-vectors consistency]
+      (.retrieveAsync c collection ids with-payload with-vectors consistency))
+    (searchAsync [_ request] (.searchAsync c request))
+    (deleteAsync [_ collection ids-or-filter] (.deleteAsync c collection ids-or-filter))
+    (createCollectionAsync [_ request] (.createCollectionAsync c request))
+    (deleteCollectionAsync [_ collection] (.deleteCollectionAsync c collection))))
+
 (defn- points
   "Every PointStruct upserted into C and still stored."
   [^FakeQdrant c]

@@ -110,6 +110,66 @@
     (is (nil? (fake/payload c "u4")) "the update finds no entry and mints none")))
 
 ;; =============================================================================
+;; Replay order: an id's ops replay as they were queued
+;; =============================================================================
+;;
+;; queue/coalesce once keyed ops by (op, id): an add and an update of one id
+;; folded under different keys and replayed in the first-seen order of the
+;; keys, not of the ops. Each case below replayed to the wrong entry.
+
+(deftest an-add-queued-after-an-update-is-the-last-write
+  (testing "S1: add v1, update, add v2, all under an open circuit"
+    (let [[s c] (live-store)]
+      (open-circuit!)
+      (proto/add-entry! s {:id "x1" :type :note :content "v1" :tags ["a"]})
+      (proto/update-entry! s "x1" {:tags ["b"]})
+      (proto/add-entry! s {:id "x1" :type :note :content "v2" :tags ["c"]})
+      (is (= [:add-entry!] (mapv :op (replay! s))) "the three fold into one write")
+      (let [p (fake/payload c "x1")]
+        (is (= "v2" (:content p)))
+        (is (= ["c"] (:tags p)) "before: the update replayed after v2 and left [b]")))))
+
+(deftest a-queued-update-between-two-queued-adds-leaves-the-last-add
+  (testing "S2: update-entry! calls only, the upsert failing transiently"
+    (let [c       (fake/client)
+          failing (atom false)
+          s       (store/create-store {:collection-name "test-update-entry" :vector-size 4})]
+      (reset! (:client-atom s) {:client (fake/flaky-upserts c failing "UNAVAILABLE: io exception")})
+      (reset! (:connected?-atom s) true)
+      (proto/add-entry! s {:id "x2" :type :note :content "c" :tags ["t0"]})
+      (circuit/configure! {:threshold 1 :cooldown-ms 60000})
+      (reset! failing true)
+      (testing "the read works and the upsert fails: the merged entry is queued as an add"
+        (is (:queued? (proto/update-entry! s "x2" {:tags ["t1"]}))))
+      (testing "that failure opened the circuit: the updates alone are queued"
+        (is (circuit/open?))
+        (is (:queued? (proto/update-entry! s "x2" {:tags ["t2"]}))))
+      (circuit/force-reset!)
+      (testing "closed again, the upsert still failing: another add is queued"
+        (is (:queued? (proto/update-entry! s "x2" {:tags ["t3"]}))))
+      (reset! failing false)
+      (is (= [:add-entry!] (mapv :op (replay! s))))
+      (let [p (fake/payload c "x2")]
+        (is (= ["t3"] (:tags p)) "before: the queued update replayed last and left [t2]")
+        (is (= "c" (:content p)))))))
+
+(deftest an-update-queued-after-a-delete-and-re-add-lands-on-the-re-add
+  (testing "S3: update, delete, add, update, all under an open circuit"
+    (let [[s c] (live-store)]
+      (proto/add-entry! s {:id "x3" :type :note :content "old" :tags ["t0"]})
+      (open-circuit!)
+      (proto/update-entry! s "x3" {:tags ["u1"]})
+      (proto/delete-entry! s "x3")
+      (proto/add-entry! s {:id "x3" :type :note :content "new" :tags ["e2"]})
+      (proto/update-entry! s "x3" {:duration "long"})
+      (is (= [:add-entry!] (mapv :op (replay! s))))
+      (let [p (fake/payload c "x3")]
+        (is (= "new" (:content p)))
+        (is (= ["e2"] (:tags p)))
+        (is (= "long" (:duration p))
+            "before: both updates folded, replayed first, then the delete and the add wiped them")))))
+
+;; =============================================================================
 ;; A read that throws
 ;; =============================================================================
 
