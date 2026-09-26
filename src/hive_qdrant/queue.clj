@@ -5,7 +5,8 @@
    When the circuit breaker opens, mutating protocol calls enqueue here
    instead of failing; reads return a degraded response. On :closed
    transition, drain! flushes the queue via a single-writer core.async
-   pipeline, coalescing by (op,id) to keep only the latest mutation.
+   pipeline, coalescing each entry id's ops, in the order they were queued,
+   into the one mutation that leaves the entry as replaying them all would.
 
    Mirrors hive-milvus.queue without the hive-weave dep — uses
    core.async bounded channel for single-writer serialization."
@@ -119,28 +120,74 @@
 ;; Coalesce
 ;; =============================================================================
 
-(defn- coalesce-key [op]
+(defn- coalesce-key
+  "Every op on one entry id shares a key, whatever the op: they fold in the
+   order they were queued (`fold-op`). An op with no id (:cleanup-expired!)
+   keys on its op."
+  [op]
   (if-let [id (:id op)]
-    [(:op op) id]
-    [:singleton (:op op)]))
+    [::entry id]
+    [::singleton (:op op)]))
+
+(defn- fold-updates
+  "Two queued update-entry! UPDATES maps for one id, U1 then U2, as the one
+   map that applies both. A later :content with no :embed-text of its own
+   retires the earlier :embed-text, which described the content it replaces:
+   run in turn, U2 would have embedded its own :content, not U1's text.
+   U1 may also be a whole queued entry: the same merge folds an update into
+   the add queued before it."
+  [u1 u2]
+  (merge (if (and (contains? u2 :content) (not (contains? u2 :embed-text)))
+           (dissoc u1 :embed-text)
+           u1)
+         u2))
+
+(defn- fold-op
+  "The one op that stands for PREV then OP, two mutations of one entry id
+   (PREV nil when OP is the first). Replaying it leaves the entry as
+   replaying both in turn would, last write winning.
+
+   An :add-entry! or :delete-entry! carries its whole outcome, so it
+   replaces PREV: an upsert overwrites the whole point (a delete queued
+   before it included), a delete removes it. An :update-entry! carries only
+   the fields it changes (the store queues the updates alone and merges them
+   onto the real entry at replay), so it folds INTO PREV:
+
+     add e,    update u  ->  add e with u merged in (`fold-updates`)
+     update v, update u  ->  one update carrying both (`fold-updates`)
+     delete,   update u  ->  the delete: update-entry! of an entry that is
+                             gone answers nil and writes nothing
+     (first)   update u  ->  itself; the replay merges onto the stored entry"
+  [prev op]
+  (if (and prev (= :update-entry! (:op op)))
+    (let [[id updates] (:args op)]
+      (case (:op prev)
+        :add-entry!    (let [[entry] (:args prev)]
+                         ;; update-entry! merges {:id id} last: the id holds.
+                         (assoc prev :args [(assoc (fold-updates entry updates) :id id)]))
+        :update-entry! (assoc op :args [id (fold-updates (second (:args prev)) updates)])
+        :delete-entry! prev
+        op))
+    op))
 
 (defn coalesce
-  "Reduce ops to the latest mutation per (op, id), preserving first-seen order."
+  "Reduce ops to one mutation per entry id: that id's ops folded in the
+   order they were queued (`fold-op`), so replaying the one op left leaves
+   the entry as replaying them all in turn would. Ids keep first-seen order.
+
+   The key is the id alone, never (op, id). Keyed by (op, id), an add and an
+   update of one id folded apart and replayed in the first-seen order of the
+   two keys: add v1, update u, add v2 replayed as add v2 then update u, and
+   u's stale fields landed over v2."
   [ops]
-  (let [indexed    (map-indexed vector ops)
-        first-seen (persistent!
-                    (reduce (fn [m [i op]]
-                              (let [k (coalesce-key op)]
-                                (if (contains? m k) m (assoc! m k i))))
-                            (transient {})
-                            indexed))
-        latest     (persistent!
-                    (reduce (fn [m op] (assoc! m (coalesce-key op) op))
-                            (transient {})
-                            ops))]
-    (->> (vals latest)
-         (sort-by #(get first-seen (coalesce-key %)))
-         vec)))
+  (let [[order folded]
+        (reduce (fn [[order folded] op]
+                  (let [k (coalesce-key op)]
+                    [(if (contains? folded k) order (conj order k))
+                     (assoc folded k (fold-op (get folded k) op))]))
+                [[] {}]
+                ops)]
+    (mapv folded order)))
 
 ;; =============================================================================
 ;; Drain (single-writer via core.async)
@@ -180,7 +227,9 @@
         failed-ops   (into [] (keep (fn [[op r]] (when (not= r ::ok) op))) results)
         ok-cnt       (- (count batch) (count failed-ops))]
     (when (seq failed-ops)
-      (swap! the-queue #(reduce conj % failed-ops)))
+      ;; Back AHEAD of anything queued while this pass ran: those ops are
+      ;; newer, and a failed op replayed after them would undo them.
+      (swap! the-queue #(into (into PersistentQueue/EMPTY failed-ops) %)))
     (swap! metrics (fn [m]
                      (-> m
                          (update :drained-ok + ok-cnt)
