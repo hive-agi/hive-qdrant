@@ -38,3 +38,20 @@
           (is (= (count ids) (count (distinct ids))) "no id twice")
           (is (= (set (map #(str "live-" %) (range 5))) (set ids))))
         (is (contains? (set (scan-ids s {:include-expired? true})) "old"))))))
+
+(deftest a-scroll-must-agree-with-the-count-before-and-after
+  (let [stable-scroll #'store/stable-scroll
+        points        (vec (range 4))]
+    (testing "a steady collection is read once"
+      (let [calls (atom 0)]
+        (is (= points (stable-scroll (constantly 4) #(do (swap! calls inc) points) 5)))
+        (is (= 1 @calls))))
+    (testing "a collection that moved during the scroll is read again"
+      (let [counts  (atom [4 5 5 5])
+            count!  #(let [c (first @counts)] (swap! counts rest) c)
+            scrolls (atom [points (conj points 4)])
+            scroll! #(let [s (first @scrolls)] (swap! scrolls rest) s)]
+        (is (= 5 (count (stable-scroll count! scroll! 5))))))
+    (testing "a scroll that always comes back short raises instead of passing"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"never matched"
+                            (stable-scroll (constantly 5) (constantly points) 2))))))
