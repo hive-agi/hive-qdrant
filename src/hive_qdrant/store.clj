@@ -942,6 +942,64 @@
                  (swap! fallback-atom assoc-in [:entries id] merged)
                  merged)))))))))
 
+(defn- expired-at?
+  "Mechanism: pure — true when `expires` names an instant before `now`. A
+   blank or unparsable value is not expired."
+  [expires ^java.time.Instant now]
+  (when (and (string? expires) (not (str/blank? expires)))
+    (when-let [at (or (try (.toInstant (java.time.ZonedDateTime/parse expires)) (catch Exception _ nil))
+                      (try (java.time.Instant/parse expires) (catch Exception _ nil)))]
+      (.isBefore ^java.time.Instant at now))))
+
+(def ^:private scan-attempts 5)
+
+(defn- stable-scroll
+  "Mechanism: pure over `count!` and `scroll!` — points from a scroll that
+   both a count before it and a count after it agree with. A collection that
+   moved during the scroll is read again; after `attempts` tries it raises,
+   so a moving or lossy scroll never passes for the whole collection."
+  [count! scroll! attempts]
+  (loop [n 1]
+    (let [before (long (count!))
+          points (scroll!)
+          after  (long (count! ))]
+      (cond
+        (= before after (count points)) points
+        (< n attempts)                  (do (Thread/sleep 1000) (recur (inc n)))
+        :else
+        (throw (ex-info "qdrant scroll never matched the collection's exact count"
+                        {:attempts n :before before :after after :scrolled (count points)}))))))
+
+(defn- scan-ids!
+  "Boundary: IO — every entry id in the collection, each once, from a scroll
+   that agrees with qdrant's exact count (see `stable-scroll`)."
+  [client collection-name include-expired?]
+  (let [^io.qdrant.client.QdrantClient qc (:client client)
+        points (stable-scroll
+                #(.get (.countAsync qc ^String collection-name nil true))
+                #(:points (q-api/scroll-points client
+                                               :collection collection-name
+                                               :limit Integer/MAX_VALUE
+                                               :payload-includes ["id" "expires"]))
+                scan-attempts)
+        now    (java.time.Instant/now)]
+    (->> points
+         (remove #(and (not include-expired?) (expired-at? (get-in % [:payload :expires]) now)))
+         (keep #(get-in % [:payload :id]))
+         distinct
+         vec)))
+
+(when-let [p (some-> (ns-resolve 'hive-spi.memory.ports 'IMemoryStoreScan) deref)]
+  (extend QdrantMemoryStore
+    p
+    {:scan-ids (fn [{:keys [config client-atom fallback-atom]} {:keys [include-expired?]}]
+                 (if-let [c @client-atom]
+                   (scan-ids! c (:collection-name config default-collection) include-expired?)
+                   (let [now (java.time.Instant/now)]
+                     (->> (vals (:entries @fallback-atom))
+                          (remove #(and (not include-expired?) (expired-at? (:expires %) now)))
+                          (mapv :id)))))}))
+
 (defn create-store
   "Construct a QdrantMemoryStore. Does NOT open a connection —
    call (proto/connect! store cfg) to activate."
