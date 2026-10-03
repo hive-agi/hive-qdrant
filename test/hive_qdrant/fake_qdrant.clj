@@ -4,10 +4,13 @@
 
    clj-qdrant.api calls its client reflectively (.upsertAsync, .retrieveAsync,
    .searchAsync, .deleteAsync; clj-qdrant.schema .createCollectionAsync and
-   .deleteCollectionAsync), so any object answering those methods is a client.
+   .deleteCollectionAsync; hive-qdrant.store .collectionExistsAsync), so any
+   object answering those methods is a client.
    This one keeps the PointStructs the store upserts: a test reads back what
    would have gone over the wire (payload keys, vector) through `payload` and
-   `point-vector`, instead of redefining the api functions.
+   `point-vector`, instead of redefining the api functions. It also keeps the
+   names of the collections created on it, and counts the create calls
+   (`create-calls`), so a test can see whether connect sent a create.
 
    Retrieved points carry their vector where a real qdrant puts it: on the
    VectorOutput `dense` field, with the deprecated `data` field empty (probed
@@ -20,7 +23,8 @@
      (def c (client))
      (reset! (:client-atom store) {:client c})
      (reset! (:connected?-atom store) true)"
-  (:import [io.qdrant.client.grpc Points$DenseVector Points$PointStruct
+  (:import [io.qdrant.client.grpc Collections$CreateCollection
+            Points$DenseVector Points$PointStruct
             Points$RetrievedPoint Points$ScoredPoint Points$SearchPoints
             Points$VectorOutput Points$VectorsOutput]
            [java.util List]
@@ -31,6 +35,7 @@
   (retrieveAsync [collection ids withPayload withVectors consistency])
   (searchAsync [request])
   (deleteAsync [collection ids-or-filter])
+  (collectionExistsAsync [collection])
   (createCollectionAsync [request])
   (deleteCollectionAsync [collection]))
 
@@ -90,7 +95,7 @@
       (.setScore (float score))
       .build))
 
-(deftype FakeQdrant [store vector-field]
+(deftype FakeQdrant [store vector-field collections creates]
   IFakeQdrant
   (upsertAsync [_ _collection points]
     (swap! store into (map (fn [^Points$PointStruct ps] [(point-key (.getId ps)) ps])) points)
@@ -109,18 +114,37 @@
     (when (instance? List ids-or-filter)
       (swap! store #(apply dissoc % (map point-key ids-or-filter))))
     (done nil))
-  (createCollectionAsync [_ _request] (done nil))
-  (deleteCollectionAsync [_ _collection]
+  (collectionExistsAsync [_ collection]
+    (done (contains? @collections collection)))
+  (createCollectionAsync [_ request]
+    (swap! creates inc)
+    (swap! collections conj (.getCollectionName ^Collections$CreateCollection request))
+    (done nil))
+  (deleteCollectionAsync [_ collection]
+    (swap! collections disj collection)
     (reset! store {})
     (done nil)))
 
 (defn client
   "A fresh, empty fake qdrant client. Retrieved vectors ride the `dense`
    field, as a real server answers; {:vector-field :data} puts them on the
-   deprecated `data` field instead."
+   deprecated `data` field instead. It remembers the collections created on
+   it (`collectionExistsAsync` answers from them) and counts every create
+   call, see `create-calls`."
   ([] (client {}))
   ([{:keys [vector-field] :or {vector-field :dense}}]
-   (->FakeQdrant (atom {}) vector-field)))
+   (->FakeQdrant (atom {}) vector-field (atom #{}) (atom 0))))
+
+(defn create-calls
+  "How many times createCollectionAsync reached the fake C, whether or not
+   the collection already existed."
+  [^FakeQdrant c]
+  @(.-creates c))
+
+(defn collections
+  "The names of the collections created on the fake C and not deleted."
+  [^FakeQdrant c]
+  @(.-collections c))
 
 (defn broken-client
   "A client whose every call throws an exception with MESSAGE, the way the
@@ -133,6 +157,7 @@
       (retrieveAsync [_ _ _ _ _ _] (boom))
       (searchAsync [_ _] (boom))
       (deleteAsync [_ _ _] (boom))
+      (collectionExistsAsync [_ _] (boom))
       (createCollectionAsync [_ _] (boom))
       (deleteCollectionAsync [_ _] (boom)))))
 
@@ -150,6 +175,7 @@
       (.retrieveAsync c collection ids with-payload with-vectors consistency))
     (searchAsync [_ request] (.searchAsync c request))
     (deleteAsync [_ collection ids-or-filter] (.deleteAsync c collection ids-or-filter))
+    (collectionExistsAsync [_ collection] (.collectionExistsAsync c collection))
     (createCollectionAsync [_ request] (.createCollectionAsync c request))
     (deleteCollectionAsync [_ collection] (.deleteCollectionAsync c collection))))
 
