@@ -335,23 +335,44 @@
         (log/debug "payload-index-create! soft-failed for" field
                    "(likely already exists):" (ex-message t))))))
 
+(def ^:private ^:const exists-probe-timeout-ms 5000)
+
+(defn- collection-exists?
+  "Boundary: IO — ask qdrant whether COLLECTION-NAME exists. true/false is
+   the server's answer; nil means the probe itself failed (threw, or did not
+   answer within `exists-probe-timeout-ms`), so the caller cannot tell."
+  [{:keys [client]} collection-name]
+  (try
+    (boolean (.get ^java.util.concurrent.Future (.collectionExistsAsync client collection-name)
+                   exists-probe-timeout-ms java.util.concurrent.TimeUnit/MILLISECONDS))
+    (catch Throwable t
+      (log/debug "collection-exists? probe failed:" (ex-message t))
+      nil)))
+
 (defn- ensure-collection!
-  "Create the collection if missing + ensure payload indexes. Best-effort —
-   swallows 'already exists'."
+  "Create the collection if missing + ensure payload indexes.
+
+   Probes `collection-exists?` first so a reconnect against an existing
+   collection never sends a create (whose ALREADY_EXISTS the java client
+   logs at ERROR with a stack trace). When the probe answers false, or
+   fails (nil), it falls back to create-and-swallow: a concurrent creator
+   may still win the race, and that 'already exists' stays benign."
   [client-map {:keys [collection-name vector-size distance]
                :or   {collection-name default-collection
                       vector-size     default-vector-size
                       distance        :cosine}}]
-  (try
-    (q-schema/collection-create! client-map
-                                 {:name        collection-name
-                                  :vector-size vector-size
-                                  :distance    distance})
-    (catch Throwable t
-      (log/debug "collection-create! soft-failed (likely already exists):"
-                 (ex-message t))
-      nil))
-  (ensure-payload-indexes! client-map (or collection-name default-collection)))
+  (let [coll (or collection-name default-collection)]
+    (when-not (true? (collection-exists? client-map coll))
+      (try
+        (q-schema/collection-create! client-map
+                                     {:name        coll
+                                      :vector-size vector-size
+                                      :distance    distance})
+        (catch Throwable t
+          (log/debug "collection-create! soft-failed (likely already exists):"
+                     (ex-message t))
+          nil)))
+    (ensure-payload-indexes! client-map coll)))
 
 ;; =============================================================================
 ;; Resilient wrapper — circuit + queue
