@@ -659,7 +659,9 @@
           existing)
 
         :else
-        (proto/add-entry! this (merge existing updates {:id id})))))
+        (let [merged (merge existing updates {:id id})
+              r      (proto/add-entry! this merged)]
+          (if (string? r) (strip-transient merged) r)))))
 
   (delete-entry! [_this id]
     (resilient
@@ -668,9 +670,9 @@
          (do (q-api/delete-points c
                                   :collection (:collection-name config default-collection)
                                   :ids [(->uuid-id id)])
-             {:success? true :id id})
+             true)
          (do (swap! fallback-atom update :entries dissoc id)
-             {:success? true :id id :backend :fallback})))
+             true)))
      {:op :delete-entry! :id id :args [id]}))
 
   (query-entries
