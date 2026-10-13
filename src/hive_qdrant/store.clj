@@ -38,7 +38,8 @@
             [hive-qdrant.deadline :as deadline]
             [hive-qdrant.failure :as failure]
             [hive-qdrant.queue :as queue]
-            [taoensso.timbre :as log])
+            [taoensso.timbre :as log]
+            [hive-qdrant.connect :as connect])
   (:import [java.util UUID]))
 
 ;; =============================================================================
@@ -310,75 +311,15 @@
 ;; Connection wrapper
 ;; =============================================================================
 
-(defn- open-client!
-  "Open a qdrant client from store config. Returns client-map. Throws when
-   the server is connected and silent (see `deadline/open-client`)."
-  [{:keys [host port api-key tls?]}]
-  (deadline/open-client {:host    (or host "localhost")
-                         :port    (or port 6334)
-                         :api-key api-key
-                         :tls?    (boolean tls?)}))
-
-(defn- ensure-payload-indexes!
-  "Create payload indexes used by query-entries. Idempotent — soft-fails
-   when an index already exists. Required fields: tags (keyword), type
-   (keyword), project-id (keyword), content-hash (keyword)."
-  [client-map collection-name]
-  (doseq [[field type] [[:tags :keyword]
-                        [:type :keyword]
-                        [:project-id :keyword]
-                        [:content-hash :keyword]]]
-    (try
-      (q-schema/payload-index-create! client-map
-                                      {:collection collection-name
-                                       :field      (name field)
-                                       :type       type})
-      (catch Throwable t
-        (log/debug "payload-index-create! soft-failed for" field
-                   "(likely already exists):" (ex-message t))))))
-
-(def ^:private ^:const exists-probe-timeout-ms 5000)
-
-(defn- collection-exists?
-  "Boundary: IO — ask qdrant whether COLLECTION-NAME exists. true/false is
-   the server's answer; nil means the probe itself failed (threw, or did not
-   answer within `exists-probe-timeout-ms`), so the caller cannot tell.
-
-   The probe RPC carries that budget as its gRPC deadline, so an unanswered
-   probe is cancelled rather than left in flight behind the timed-out `.get`."
-  [client-map collection-name]
-  (try
-    (let [client (:client (deadline/bounded client-map exists-probe-timeout-ms))]
-      (boolean (.get ^java.util.concurrent.Future (.collectionExistsAsync client collection-name)
-                     exists-probe-timeout-ms java.util.concurrent.TimeUnit/MILLISECONDS)))
-    (catch Throwable t
-      (log/debug "collection-exists? probe failed:" (ex-message t))
-      nil)))
+(def ^:private open-client! connect/open!)
 
 (defn- ensure-collection!
-  "Create the collection if missing + ensure payload indexes.
-
-   Probes `collection-exists?` first so a reconnect against an existing
-   collection never sends a create (whose ALREADY_EXISTS the java client
-   logs at ERROR with a stack trace). When the probe answers false, or
-   fails (nil), it falls back to create-and-swallow: a concurrent creator
-   may still win the race, and that 'already exists' stays benign."
-  [client-map {:keys [collection-name vector-size distance]
-               :or   {collection-name default-collection
-                      vector-size     default-vector-size
-                      distance        :cosine}}]
-  (let [coll (or collection-name default-collection)]
-    (when-not (true? (collection-exists? client-map coll))
-      (try
-        (q-schema/collection-create! client-map
-                                     {:name        coll
-                                      :vector-size vector-size
-                                      :distance    distance})
-        (catch Throwable t
-          (log/debug "collection-create! soft-failed (likely already exists):"
-                     (ex-message t))
-          nil)))
-    (ensure-payload-indexes! client-map coll)))
+  "`connect/ensure-collection!` with the store's defaults under CFG."
+  [client-map cfg]
+  (connect/ensure-collection!
+   client-map
+   (merge {:collection-name default-collection :vector-size default-vector-size}
+          (into {} (filter (comp some? val)) cfg))))
 
 ;; =============================================================================
 ;; Resilient wrapper — circuit + queue

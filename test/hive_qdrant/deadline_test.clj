@@ -28,7 +28,8 @@
             [hive-qdrant.fake-qdrant :as fake]
             [hive-qdrant.stalled-qdrant :as stalled]
             [hive-qdrant.store :as store]
-            [hive-spi.memory.ports :as proto])
+            [hive-spi.memory.ports :as proto]
+            [hive-qdrant.connect :as connect])
   (:import [java.util.concurrent Future TimeUnit TimeoutException]))
 
 (use-fixtures :each (fn [t] (circuit/force-reset!) (t) (circuit/force-reset!)))
@@ -69,23 +70,25 @@
   (some-> (ns-resolve 'hive-spi.memory.ports 'scan-ids) deref))
 
 (defn- store-reads
-  "Every read the store can send to qdrant: [label rpc-method thunk]."
+  "Every read the store can send to qdrant: [label rpc-method thunk kind].
+   KIND names the deadline the call site must use: :read, :search, or :probe
+   for the exists probe, which keeps its own fixed budget."
   [s]
   (cond-> [["get-entry" "qdrant.Points/Get"
-            #(proto/get-entry s "an-id")]
+            #(proto/get-entry s "an-id") :read]
            ["get-entries" "qdrant.Points/Get"
-            #(proto/get-entries s ["a" "b"])]
+            #(proto/get-entries s ["a" "b"]) :read]
            ["query-entries" "qdrant.Points/Scroll"
-            #(proto/query-entries s {:type "note" :limit 5})]
+            #(proto/query-entries s {:type "note" :limit 5}) :read]
            ["find-duplicate" "qdrant.Points/Scroll"
-            #(proto/find-duplicate s "note" "a-hash" {})]
+            #(proto/find-duplicate s "note" "a-hash" {}) :read]
            ["search-similar" "qdrant.Points/Search"
-            #(proto/search-similar s "q" {:embedding [0.1 0.2 0.3 0.4]})]
+            #(proto/search-similar s "q" {:embedding [0.1 0.2 0.3 0.4]}) :search]
            ["update-metadata! (its read)" "qdrant.Points/Get"
-            #(proto/update-metadata! s "an-id" {:tags ["t"]})]
+            #(proto/update-metadata! s "an-id" {:tags ["t"]}) :read]
            ["collection-exists? probe" "qdrant.Collections/CollectionExists"
-            #(#'store/collection-exists? @(:client-atom s) "a-collection")]]
-    scan-ids (conj ["scan-ids" "qdrant.Points/Count" #(scan-ids s {})])))
+            #(connect/collection-exists? @(:client-atom s) "a-collection") :probe]]
+    scan-ids (conj ["scan-ids" "qdrant.Points/Count" #(scan-ids s {}) :read])))
 
 ;; ---- Golden ---------------------------------------------------------------
 
@@ -109,18 +112,18 @@
 (deftest golden-config-seeds-the-deadlines
   (testing "defaults"
     (let [m (:ok (cfg/resolve-QdrantConfig {} {:env-fn (constantly nil)}))]
-      (is (= 15000 (:read-deadline-ms m)))
-      (is (= 60000 (:search-deadline-ms m)))))
-  (testing "env"
+      (is (= 15000 (deadline/read-deadline-ms m)))
+      (is (= 60000 (deadline/search-deadline-ms m)))))
+  (testing "env: the value arrives as written and is parsed by the deadline ns"
     (let [env {"QDRANT_READ_DEADLINE_MS" "3000" "QDRANT_SEARCH_DEADLINE_MS" "45000"}
           res (cfg/resolve-QdrantConfig {} {:env-fn #(get env %)})]
       (is (r/ok? res))
-      (is (= 3000 (-> res :ok :read-deadline-ms)))
-      (is (= 45000 (-> res :ok :search-deadline-ms)))))
+      (is (= 3000 (deadline/read-deadline-ms (:ok res))))
+      (is (= 45000 (deadline/search-deadline-ms (:ok res))))))
   (testing "an override wins over env"
     (let [res (cfg/resolve-QdrantConfig {:read-deadline-ms 700}
                                         {:env-fn {"QDRANT_READ_DEADLINE_MS" "3000"}})]
-      (is (= 700 (-> res :ok :read-deadline-ms))))))
+      (is (= 700 (deadline/read-deadline-ms (:ok res)))))))
 
 (deftest a-fake-client-is-handed-back-unchanged
   (let [cm {:client (fake/client)}]
@@ -131,17 +134,22 @@
 ;; ---- The wire: reads ------------------------------------------------------
 
 (deftest every-store-read-ends-within-its-deadline
+  ;; The two deadlines are far apart, so the time a call took says which one
+  ;; its call site used: a read sent through the search client would end at
+  ;; 2000 ms, a search sent through the read client at 400.
   (with-stalled-store [server s {:read-deadline-ms   deadline-ms
-                                 :search-deadline-ms deadline-ms}]
-    (doseq [[label method thunk] (store-reads s)]
+                                 :search-deadline-ms 2000}]
+    (doseq [[label method thunk kind] (store-reads s)]
       (testing label
         ;; a tripped circuit would answer without sending anything
         (circuit/force-reset!)
         (let [before (count (stalled/calls server))
               {:keys [hung? ms]} (timed thunk)]
           (is (not hung?) "the call came back: its thread is free")
-          ;; the exists probe keeps its own fixed budget
-          (is (< ms (+ deadline/default-connect-deadline-ms 3000)) (str "took " ms " ms"))
+          (case kind
+            :read   (is (< ms 1500) (str "took " ms " ms, the read deadline is " deadline-ms))
+            :search (is (<= 1800 ms 4500) (str "took " ms " ms, the search deadline is 2000"))
+            :probe  (is (< ms (+ connect/exists-probe-timeout-ms 3000)) (str "took " ms " ms")))
           (is (some #{method} (drop before (stalled/calls server)))
               "the RPC really reached the stalled server"))))))
 

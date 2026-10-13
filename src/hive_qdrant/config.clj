@@ -50,13 +50,18 @@
                         :default false
                         :type :bool
                         :doc "Enable TLS on the client connection.")
+  ;; The two deadlines are :string on purpose. An :int field that fails to
+  ;; coerce fails the whole resolution, and with it the addon's initialize!:
+  ;; a typo in a tuning knob would keep the store from starting. The value is
+  ;; handed over as written and hive-qdrant.deadline parses it, falling back
+  ;; to the default (and saying so) when it is unusable.
   :read-deadline-ms (env "QDRANT_READ_DEADLINE_MS"
                          :default 15000
-                         :type :int
+                         :type :string
                          :doc "gRPC deadline of a retrieve, scroll or count RPC, in ms.")
   :search-deadline-ms (env "QDRANT_SEARCH_DEADLINE_MS"
                            :default 60000
-                           :type :int
+                           :type :string
                            :doc "gRPC deadline of a search RPC, in ms.")
   :collection-name (literal "hive_qdrant_memory"
                             :doc "Default collection — overridable via addon config."))

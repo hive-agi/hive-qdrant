@@ -25,9 +25,14 @@
      :search-deadline-ms  search                    (default 60000)
 
    hive-qdrant.config seeds both from QDRANT_READ_DEADLINE_MS and
-   QDRANT_SEARCH_DEADLINE_MS. A missing, non-numeric or non-positive value,
-   or one over an hour, falls back to the default: a deadline cannot be
-   switched off by accident.
+   QDRANT_SEARCH_DEADLINE_MS and hands the value over as it was written: it
+   is parsed here and nowhere else. A missing, non-numeric or non-positive
+   value, or one over an hour, falls back to the default and is logged once:
+   a deadline cannot be switched off by accident, and a typo in one never
+   stops the store from starting.
+
+   connect! may be given the two keys as well. The deadlines it resolves ride
+   on the client it opens (`with-deadlines`) and win over the store config.
 
    Writes are left alone. They go through the circuit and the replay queue,
    and a write cancelled mid-flight may or may not have landed.
@@ -38,8 +43,10 @@
    `open-client` covers the one read the java client sends by itself: the
    health check its builder runs, which has no deadline either."
   (:require [clj-qdrant.client :as q-client]
-            [clojure.string :as str])
-  (:import [io.grpc ManagedChannelBuilder Status Status$Code]
+            [clojure.string :as str]
+            [taoensso.timbre :as log])
+  (:import [io.grpc ConnectivityState ManagedChannel ManagedChannelBuilder
+            Status Status$Code]
            [io.qdrant.client QdrantClient QdrantGrpcClient
             WithPayloadSelectorFactory WithVectorsSelectorFactory]
            [io.qdrant.client.grpc Common$Filter
@@ -71,17 +78,43 @@
             (string? x)  (parse-long (str/trim x)))]
     (when (and n (<= 1 n max-deadline-ms)) (long n))))
 
+(defonce ^:private reported (atom #{}))
+
+(defn- configured-ms
+  "The deadline CONFIG asks for under K, or DEFAULT when it asks for none or
+   for an unusable one. An unusable one is reported, once per value: the
+   operator who set it otherwise gets the default and no sign of it."
+  [config k default]
+  (let [v (get config k)]
+    (or (usable-ms v)
+        (do (when (and (some? v) (not (contains? @reported [k v])))
+              (swap! reported conj [k v])
+              (log/warn "hive-qdrant: unusable" k (pr-str v) "- using the default of"
+                        default "ms (want a whole number of ms from 1 to"
+                        (str max-deadline-ms ")")))
+            default))))
+
 (defn read-deadline-ms
-  "The read deadline CONFIG asks for, in ms; the default when it asks for
-   none or for an unusable one."
-  [config]
-  (or (usable-ms (:read-deadline-ms config)) default-read-deadline-ms))
+  "The read deadline, in ms: the one CLIENT-MAP was opened with (see
+   `with-deadlines`), else the one CONFIG asks for, else the default."
+  ([config] (configured-ms config :read-deadline-ms default-read-deadline-ms))
+  ([client-map config] (or (::read-ms client-map) (read-deadline-ms config))))
 
 (defn search-deadline-ms
-  "The search deadline CONFIG asks for, in ms; the default when it asks for
-   none or for an unusable one."
-  [config]
-  (or (usable-ms (:search-deadline-ms config)) default-search-deadline-ms))
+  "The search deadline, in ms: the one CLIENT-MAP was opened with (see
+   `with-deadlines`), else the one CONFIG asks for, else the default."
+  ([config] (configured-ms config :search-deadline-ms default-search-deadline-ms))
+  ([client-map config] (or (::search-ms client-map) (search-deadline-ms config))))
+
+(defn with-deadlines
+  "CLIENT-MAP carrying the deadlines CONFIG resolves to. connect! opens its
+   client from the store config merged with the cfg it was called with, so
+   the deadlines of that merge ride on the client: a read sent through it
+   uses them, whatever config the caller of `read-client` holds."
+  [client-map config]
+  (assoc client-map
+         ::read-ms   (read-deadline-ms config)
+         ::search-ms (search-deadline-ms config)))
 
 (definterface IReadClient
   (retrieveAsync [collection ids withPayload withVectors consistency])
@@ -123,14 +156,15 @@
 
 (defn read-client
   "CLIENT-MAP for a retrieve, scroll or count: every RPC sent through it
-   ends within CONFIG's read deadline."
+   ends within the read deadline (see `read-deadline-ms`)."
   [client-map config]
-  (bounded client-map (read-deadline-ms config)))
+  (bounded client-map (read-deadline-ms client-map config)))
 
 (defn search-client
-  "CLIENT-MAP for a search: the RPC ends within CONFIG's search deadline."
+  "CLIENT-MAP for a search: the RPC ends within the search deadline (see
+   `search-deadline-ms`)."
   [client-map config]
-  (bounded client-map (search-deadline-ms config)))
+  (bounded client-map (search-deadline-ms client-map config)))
 
 (def ^:const default-connect-deadline-ms
   "How long a freshly opened client waits for the server's first answer."
@@ -142,29 +176,50 @@
   (boolean (some #(= Status$Code/DEADLINE_EXCEEDED (.getCode (Status/fromThrowable %)))
                  (take-while some? (iterate #(.getCause ^Throwable %) t)))))
 
-(defn- silent?
-  "True when the server behind QC answers no health check within MS: the
-   connection is up and nothing comes back. A server that answers, and one
-   that fails at once (refused, unreachable), are both not silent."
-  [^QdrantClient qc ms]
+(defn- first-answer
+  "What the server behind QC, reached over CHANNEL, does with a health check
+   under a deadline of MS:
+
+     :answered   it answered, with a reply or with an error status
+     :silent     the channel is READY (the connection is up) and nothing
+                 came back within MS
+     :unreached  the channel never got READY: the connection was refused,
+                 or it was still being made when the check ended, as with a
+                 host that drops every packet
+
+   DEADLINE_EXCEEDED alone does not tell the last two apart: a call that
+   waits MS for a connection ends with that status as well."
+  [^QdrantClient qc ^ManagedChannel channel ms]
   (try
     (.get (.healthCheckAsync qc (Duration/ofMillis (long ms))))
-    false
+    :answered
     (catch Throwable t
-      (deadline-exceeded? t))))
+      (cond
+        (not= ConnectivityState/READY (.getState channel false)) :unreached
+        (deadline-exceeded? t)                                   :silent
+        :else                                                    :answered))))
 
 (defn open-client
   "Open a qdrant client for CFG ({:host :port :api-key :tls?}) and answer the
-   client-map clj-qdrant's api takes. Throws when the server accepts the
-   connection and then answers nothing within MS (default
-   `default-connect-deadline-ms`); the client is closed first.
+   client-map clj-qdrant's api takes, plus :reached?.
+
+   The server gets MS (default `default-connect-deadline-ms`) to answer one
+   health check (see `first-answer`):
+
+     answered   {:client .. :grpc-client .. :reached? true}
+     unreached  the same with :reached? false. The store is down; the caller
+                keeps the client, and the circuit and the replay queue own
+                what is sent through it, as they did before this check
+                existed
+     silent     throws :qdrant/unresponsive, the client closed first: a
+                connected store that answers nothing would park every call
+                that has no deadline, the creates connect! sends among them
 
    clj-qdrant.client/make is not used: the java client's builder sends a
    blocking HealthCheck with NO deadline (its version-compatibility check),
-   so against a stalled server `make` itself never returns. The client is
+   so against a silent server `make` itself never returns. The client is
    built here with that check off, and the health check is sent under a
-   deadline. A server that is down fails that check at once, is not silent,
-   and gets its client-map as before: the circuit and the queue own that case."
+   deadline."
   ([cfg] (open-client cfg default-connect-deadline-ms))
   ([{:keys [host port api-key tls?]} ms]
    (let [host    (or host "localhost")
@@ -174,12 +229,13 @@
          channel (.build (if tls? (.useTransportSecurity chan-b) (.usePlaintext chan-b)))
          b       (QdrantGrpcClient/newBuilder channel false false)
          grpc    (.build (if api-key (.withApiKey b ^String api-key) b))
-         client  (QdrantClient. grpc)]
-     (when (silent? client ms)
+         client  (QdrantClient. grpc)
+         answer  (first-answer client channel ms)]
+     (when (= :silent answer)
        (.close client)
        (.shutdownNow channel)
-       (throw (ex-info (str "qdrant at " host ":" port " accepted the connection and"
+       (throw (ex-info (str "qdrant at " host ":" port " is connected and"
                             " answered no health check within " ms " ms"
                             " (DEADLINE_EXCEEDED)")
                        {:error :qdrant/unresponsive :host host :port port :deadline-ms ms})))
-     {:client client :grpc-client grpc})))
+     {:client client :grpc-client grpc :reached? (= :answered answer)})))
