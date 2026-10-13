@@ -1,41 +1,44 @@
 (ns hive-qdrant.deadline
-  "Per-call gRPC deadlines for the store's READ RPCs.
+  "Per-call gRPC deadlines for every RPC the store sends.
 
    A caller-side timeout (a future deref'd with a budget, as hive-carto's
    vectordb facade does) frees the caller and nothing else: the RPC stays in
    flight and its thread stays parked until the store answers or the
-   connection drops. A dead store then costs one parked thread per read.
+   connection drops. A dead store then costs one parked thread per call.
 
-   The java client takes a `Duration` on every read RPC and turns it into
+   The java client takes a `Duration` on every RPC and turns it into
    `withDeadlineAfter` on the stub, so the call itself ends: gRPC cancels it,
    the future fails with DEADLINE_EXCEEDED, and the blocked `.get` returns.
    hive-qdrant.failure classifies that status as transient.
 
    clj-qdrant calls its client reflectively and passes no Duration, so the
-   deadline is added here, without a change to clj-qdrant: `read-client` and
-   `search-client` answer a client-map whose :client is a VIEW of the real
-   QdrantClient. The view answers the read methods clj-qdrant and the store
-   call, each forwarded to the java client's Duration overload. It answers no
-   write method, so a write sent through a read view fails at the call
-   instead of silently gaining a deadline.
+   deadline is added here, without a change to clj-qdrant: `read-client`,
+   `search-client` and `write-client` answer a client-map whose :client is a
+   VIEW of the real QdrantClient. A read view answers the read methods
+   clj-qdrant and the store call, a write view the write methods, each
+   forwarded to the java client's Duration overload. Neither answers the
+   other's methods, so a call sent through the wrong view fails at the call
+   instead of silently gaining the wrong deadline.
 
    Deadlines, in milliseconds, come from the store config:
 
      :read-deadline-ms    retrieve, scroll, count   (default 15000)
      :search-deadline-ms  search                    (default 60000)
+     :write-deadline-ms   upsert, delete, creates   (default 30000)
 
-   hive-qdrant.config seeds both from QDRANT_READ_DEADLINE_MS and
-   QDRANT_SEARCH_DEADLINE_MS and hands the value over as it was written: it
-   is parsed here and nowhere else. A missing, non-numeric or non-positive
-   value, or one over an hour, falls back to the default and is logged once:
-   a deadline cannot be switched off by accident, and a typo in one never
-   stops the store from starting.
+   hive-qdrant.config seeds them from QDRANT_READ_DEADLINE_MS,
+   QDRANT_SEARCH_DEADLINE_MS and QDRANT_WRITE_DEADLINE_MS and hands each value
+   over as it was written: it is parsed here and nowhere else. A missing,
+   non-numeric or non-positive value, or one over an hour, falls back to the
+   default and is logged once: a deadline cannot be switched off by accident,
+   and a typo in one never stops the store from starting.
 
-   connect! may be given the two keys as well. The deadlines it resolves ride
-   on the client it opens (`with-deadlines`) and win over the store config.
+   connect! may be given the keys as well. The deadlines it resolves ride on
+   the client it opens (`with-deadlines`) and win over the store config.
 
-   Writes are left alone. They go through the circuit and the replay queue,
-   and a write cancelled mid-flight may or may not have landed.
+   A write that misses its deadline fails, so the circuit records it and the
+   replay queue takes it. It may still have landed: the replay of an upsert
+   or a delete by id is idempotent.
 
    A client that is not a QdrantClient (the fakes under test/) is handed back
    unchanged: there is no RPC to bound.
@@ -49,8 +52,10 @@
             Status Status$Code]
            [io.qdrant.client QdrantClient QdrantGrpcClient
             WithPayloadSelectorFactory WithVectorsSelectorFactory]
-           [io.qdrant.client.grpc Common$Filter
-            Points$ReadConsistency Points$ScrollPoints Points$SearchPoints]
+           [io.qdrant.client.grpc Collections$CreateCollection
+            Collections$PayloadIndexParams Collections$PayloadSchemaType
+            Common$Filter Points$ReadConsistency Points$ScrollPoints
+            Points$SearchPoints Points$WriteOrderingType]
            [java.time Duration]
            [java.util List]))
 
@@ -62,6 +67,13 @@
 (def ^:const default-search-deadline-ms
   "Deadline of a search RPC, the slowest read on a large collection."
   60000)
+
+(def ^:const default-write-deadline-ms
+  "Deadline of a write RPC: an upsert, a delete, a collection or payload
+   index create. Long, because a write may wait on a busy segment; finite,
+   because a write parked forever records no failure, so it never opens the
+   circuit and never reaches the replay queue."
+  30000)
 
 (def ^:const max-deadline-ms
   "The longest deadline a config may ask for: one hour. Anything longer is
@@ -106,15 +118,22 @@
   ([config] (configured-ms config :search-deadline-ms default-search-deadline-ms))
   ([client-map config] (or (::search-ms client-map) (search-deadline-ms config))))
 
+(defn write-deadline-ms
+  "The write deadline, in ms: the one CLIENT-MAP was opened with (see
+   `with-deadlines`), else the one CONFIG asks for, else the default."
+  ([config] (configured-ms config :write-deadline-ms default-write-deadline-ms))
+  ([client-map config] (or (::write-ms client-map) (write-deadline-ms config))))
+
 (defn with-deadlines
   "CLIENT-MAP carrying the deadlines CONFIG resolves to. connect! opens its
    client from the store config merged with the cfg it was called with, so
-   the deadlines of that merge ride on the client: a read sent through it
+   the deadlines of that merge ride on the client: a call sent through it
    uses them, whatever config the caller of `read-client` holds."
   [client-map config]
   (assoc client-map
          ::read-ms   (read-deadline-ms config)
-         ::search-ms (search-deadline-ms config)))
+         ::search-ms (search-deadline-ms config)
+         ::write-ms  (write-deadline-ms config)))
 
 (definterface IReadClient
   (retrieveAsync [collection ids withPayload withVectors consistency])
@@ -166,11 +185,52 @@
   [client-map config]
   (bounded client-map (search-deadline-ms client-map config)))
 
+(definterface IWriteClient
+  (upsertAsync [collection points])
+  (deleteAsync [collection ids])
+  (createCollectionAsync [request])
+  (createPayloadIndexAsync [collection field schema-type params wait ordering timeout]))
+
+(defn- write-view
+  "A write-only view of QC whose every call carries the deadline D. It
+   answers the write methods clj-qdrant calls and no read, so a read sent
+   through it fails at the call instead of gaining the write deadline."
+  [^QdrantClient qc ^Duration d]
+  (reify IWriteClient
+    (upsertAsync [_ collection points]
+      (.upsertAsync qc ^String collection ^List points d))
+    (deleteAsync [_ collection ids]
+      (.deleteAsync qc ^String collection ^List ids d))
+    (createCollectionAsync [_ request]
+      (.createCollectionAsync qc ^Collections$CreateCollection request d))
+    (createPayloadIndexAsync [_ collection field schema-type params wait ordering _timeout]
+      (.createPayloadIndexAsync qc ^String collection ^String field
+                                ^Collections$PayloadSchemaType schema-type
+                                ^Collections$PayloadIndexParams params
+                                ^Boolean wait ^Points$WriteOrderingType ordering d))))
+
+(defn write-client
+  "CLIENT-MAP for a write (upsert, delete, collection or payload index
+   create): every RPC sent through it ends within the write deadline (see
+   `write-deadline-ms`). A write that misses it fails DEADLINE_EXCEEDED,
+   which hive-qdrant.failure classifies transient, so the store records the
+   failure on the circuit and queues the write for replay. The write may
+   still have landed; upsert and delete by id replay idempotently.
+
+   nil stays nil; a client that is not a QdrantClient is handed back
+   unchanged."
+  [client-map config]
+  (let [c (:client client-map)]
+    (if (instance? QdrantClient c)
+      (assoc client-map :client
+             (write-view c (Duration/ofMillis (long (write-deadline-ms client-map config)))))
+      client-map)))
+
 (def ^:const default-connect-deadline-ms
   "How long a freshly opened client waits for the server's first answer."
   5000)
 
-(defn- deadline-exceeded?
+(defn deadline-exceeded?
   "True when T, or a cause of T, is gRPC's DEADLINE_EXCEEDED."
   [^Throwable t]
   (boolean (some #(= Status$Code/DEADLINE_EXCEEDED (.getCode (Status/fromThrowable %)))

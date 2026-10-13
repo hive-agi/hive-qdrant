@@ -483,7 +483,7 @@
     (try
       (let [resolved (merge config cfg)
             client   (open-client! resolved)]
-        (ensure-collection! client resolved)
+        (try (ensure-collection! client resolved) (catch Throwable t (try (q-client/close! client) (catch Throwable _ nil)) (throw t)))
         (reset! client-atom client)
         (reset! connected?-atom true)
         (circuit/force-reset!)
@@ -547,7 +547,7 @@
                (let [v     (or (:vector rv)
                                (do (warn-unembedded! coll) (zero-vec vs)))
                      point (entry->point entry+id v)]
-                 (q-api/upsert-points c :collection coll :points [point])
+                 (q-api/upsert-points (deadline/write-client c config) :collection coll :points [point])
                  ;; Contract: return the id string (not the {:success? true ...} map)
                  ;; — matches hive-milvus/hive-chroma so the crud write path's
                  ;; `(string? raw-id)` guard accepts the result.
@@ -614,9 +614,7 @@
     (resilient
      (fn []
        (if-let [c @client-atom]
-         (do (q-api/delete-points c
-                                  :collection (:collection-name config default-collection)
-                                  :ids [(->uuid-id id)])
+         (do (q-api/delete-points (deadline/write-client c config) :collection (:collection-name config default-collection) :ids [(->uuid-id id)])
              true)
          (do (swap! fallback-atom update :entries dissoc id)
              true)))
@@ -902,8 +900,7 @@
                    ;; may carry in its raw payload.
                    (let [payload (:payload (q-api/point->map rp))
                          merged  (strip-transient (merge payload updates {:id id}))]
-                     (q-api/upsert-points c :collection coll
-                                          :points [(entry->point merged v)])
+                     (q-api/upsert-points (deadline/write-client c config) :collection coll :points [(entry->point merged v)])
                      merged)
                    ;; No vector came back: the honest write is the embedding one.
                    (proto/update-entry! this id updates))))

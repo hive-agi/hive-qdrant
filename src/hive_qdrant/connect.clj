@@ -15,7 +15,8 @@
   (:require [clj-qdrant.schema :as q-schema]
             [hive-qdrant.deadline :as deadline]
             [taoensso.timbre :as log])
-  (:import [java.util.concurrent Future TimeUnit]))
+  (:import [java.util.concurrent Future TimeUnit]
+[java.util.concurrent TimeoutException]))
 
 (defn open!
   "Open a qdrant client from the store config CFG ({:host :port :api-key
@@ -25,10 +26,28 @@
   [cfg]
   (deadline/with-deadlines (deadline/open-client cfg) cfg))
 
+(defn- unresponsive
+  "The :qdrant/unresponsive failure for STEP, a connect-time RPC the store
+   did not answer within its deadline, caused by T."
+  [step ^Throwable t]
+  (ex-info (str "qdrant answered its health check and then no " step
+                " (DEADLINE_EXCEEDED)")
+           {:error :qdrant/unresponsive :step step}
+           t))
+
+(defn- timed-out?
+  "True when T says the server did not answer in time: gRPC's
+   DEADLINE_EXCEEDED, or the local budget of a `.get` running out."
+  [^Throwable t]
+  (or (instance? TimeoutException t) (deadline/deadline-exceeded? t)))
+
 (defn- ensure-payload-indexes!
   "Create payload indexes used by query-entries. Idempotent: soft-fails
    when an index already exists. Required fields: tags (keyword), type
-   (keyword), project-id (keyword), content-hash (keyword)."
+   (keyword), project-id (keyword), content-hash (keyword).
+
+   Each create carries the write deadline (CLIENT-MAP is a write view); one
+   the store does not answer in time is no soft failure, and throws."
   [client-map collection-name]
   (doseq [[field type] [[:tags :keyword]
                         [:type :keyword]
@@ -40,6 +59,7 @@
                                        :field      (name field)
                                        :type       type})
       (catch Throwable t
+        (when (timed-out? t) (throw (unresponsive "payload index create" t)))
         (log/debug "payload-index-create! soft-failed for" field
                    "(likely already exists):" (ex-message t))))))
 
@@ -47,8 +67,11 @@
 
 (defn collection-exists?
   "Boundary: IO. Ask qdrant whether COLLECTION-NAME exists. true/false is
-   the server's answer; nil means the probe itself failed (threw, or did not
-   answer within `exists-probe-timeout-ms`), so the caller cannot tell.
+   the server's answer; nil means the probe failed with an error, so the
+   caller cannot tell. A probe the server did not answer within
+   `exists-probe-timeout-ms` throws :qdrant/unresponsive: the store answered
+   its health check and then went silent, and a create sent after it would
+   only wait out its own deadline.
 
    The probe RPC carries that budget as its gRPC deadline, so an unanswered
    probe is cancelled rather than left in flight behind the timed-out `.get`."
@@ -58,6 +81,7 @@
       (boolean (.get ^Future (.collectionExistsAsync client collection-name)
                      exists-probe-timeout-ms TimeUnit/MILLISECONDS)))
     (catch Throwable t
+      (when (timed-out? t) (throw (unresponsive "collection exists probe" t)))
       (log/debug "collection-exists? probe failed:" (ex-message t))
       nil)))
 
@@ -67,26 +91,35 @@
    Probes `collection-exists?` first so a reconnect against an existing
    collection never sends a create (whose ALREADY_EXISTS the java client
    logs at ERROR with a stack trace). When the probe answers false, or
-   fails (nil), it falls back to create-and-swallow: a concurrent creator
-   may still win the race, and that 'already exists' stays benign.
+   fails with an error (nil), it falls back to create-and-swallow: a
+   concurrent creator may still win the race, and that 'already exists'
+   stays benign.
+
+   Every RPC here is bounded: the probe by `exists-probe-timeout-ms`, the
+   creates by the write deadline (`deadline/write-client`). One the store
+   does not answer in time throws :qdrant/unresponsive, so connect! fails
+   instead of parking on a store that answered its health check and then
+   stalled.
 
    A client opened on a store it could not reach (`:reached? false`) sends
-   nothing: every create would fail, or wait with no deadline for a
+   nothing: every create would fail, or wait out its deadline for a
    connection that is not coming."
   [client-map {:keys [collection-name vector-size distance]
-               :or   {distance :cosine}}]
+               :or   {distance :cosine}
+               :as   cfg}]
   (if (false? (:reached? client-map))
     (log/warn "hive-qdrant: qdrant unreachable at connect;" collection-name
               "is not ensured, writes go to the replay queue")
-    (do
+    (let [writer (deadline/write-client client-map cfg)]
       (when-not (true? (collection-exists? client-map collection-name))
         (try
-          (q-schema/collection-create! client-map
+          (q-schema/collection-create! writer
                                        {:name        collection-name
                                         :vector-size vector-size
                                         :distance    distance})
           (catch Throwable t
+            (when (timed-out? t) (throw (unresponsive "collection create" t)))
             (log/debug "collection-create! soft-failed (likely already exists):"
                        (ex-message t))
             nil)))
-      (ensure-payload-indexes! client-map collection-name))))
+      (ensure-payload-indexes! writer collection-name))))
