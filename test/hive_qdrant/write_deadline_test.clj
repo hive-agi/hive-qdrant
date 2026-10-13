@@ -51,8 +51,9 @@
 ;; ---- connect! ---------------------------------------------------------------
 
 (deftest connect-to-a-store-that-stalls-after-its-health-check-fails
-  (testing "healthy at the health check, silent after: the exists probe misses
-            its deadline, connect! fails and sends no create"
+  (testing "healthy at the health check, silent after: the probe times out,
+            the create it falls back to misses the write deadline, and
+            connect! fails instead of parking"
     (with-open [server (stalled/start)]
       (let [s (store/create-store {:vector-size 4})
             {:keys [hung? value ms]}
@@ -60,13 +61,14 @@
         (is (not hung?) "connect! came back")
         (is (< ms (+ connect/exists-probe-timeout-ms 3000)) (str "took " ms " ms"))
         (is (false? (:success? value)) (pr-str value))
+        (is (str/includes? (str (first (:errors value))) "collection create") (pr-str value))
         (is (str/includes? (str (first (:errors value))) "DEADLINE_EXCEEDED") (pr-str value))
         (is (false? (proto/connected? s)))
         (is (nil? @(:client-atom s)) "the failed connect kept no client")
-        (is (not (some #{"qdrant.Collections/Create"} (stalled/calls server)))
-            "no create was sent after the probe went unanswered"))))
-  (testing "the probe says the collection is missing and the create stalls:
-            the create misses the write deadline and connect! fails"
+        (is (some #{"qdrant.Collections/Create"}
+                  (await-cancelled server "qdrant.Collections/Create"))
+            "the create was cancelled on the wire, not left in flight"))))
+  (testing "the probe says the collection is missing and the create stalls"
     (with-open [server (stalled/start)]
       (let [s (store/create-store {:vector-size 4})
             {:keys [hung? value ms]}
@@ -75,11 +77,7 @@
         (is (not hung?) "connect! came back")
         (is (< ms 3000) (str "took " ms " ms, the write deadline is 400"))
         (is (false? (:success? value)) (pr-str value))
-        (is (str/includes? (str (first (:errors value))) "collection create") (pr-str value))
-        (is (false? (proto/connected? s)))
-        (is (some #{"qdrant.Collections/Create"}
-                  (await-cancelled server "qdrant.Collections/Create"))
-            "the create was cancelled on the wire, not left in flight")))))
+        (is (false? (proto/connected? s)))))))
 
 (deftest a-stalled-payload-index-create-fails-the-ensure
   (testing "the collection exists, the index create stalls: the ensure throws"

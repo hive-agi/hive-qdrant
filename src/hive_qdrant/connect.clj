@@ -67,11 +67,9 @@
 
 (defn collection-exists?
   "Boundary: IO. Ask qdrant whether COLLECTION-NAME exists. true/false is
-   the server's answer; nil means the probe failed with an error, so the
-   caller cannot tell. A probe the server did not answer within
-   `exists-probe-timeout-ms` throws :qdrant/unresponsive: the store answered
-   its health check and then went silent, and a create sent after it would
-   only wait out its own deadline.
+   the server's answer; nil means the probe itself failed (threw, or did not
+   answer within `exists-probe-timeout-ms`), so the caller cannot tell and
+   falls back to the create, which carries the write deadline.
 
    The probe RPC carries that budget as its gRPC deadline, so an unanswered
    probe is cancelled rather than left in flight behind the timed-out `.get`."
@@ -81,7 +79,6 @@
       (boolean (.get ^Future (.collectionExistsAsync client collection-name)
                      exists-probe-timeout-ms TimeUnit/MILLISECONDS)))
     (catch Throwable t
-      (when (timed-out? t) (throw (unresponsive "collection exists probe" t)))
       (log/debug "collection-exists? probe failed:" (ex-message t))
       nil)))
 
