@@ -35,6 +35,7 @@
             [clojure.string :as str]
             [hive-spi.memory.ports :as proto]
             [hive-qdrant.circuit :as circuit]
+            [hive-qdrant.deadline :as deadline]
             [hive-qdrant.failure :as failure]
             [hive-qdrant.queue :as queue]
             [taoensso.timbre :as log])
@@ -310,12 +311,13 @@
 ;; =============================================================================
 
 (defn- open-client!
-  "Open a clj-qdrant client from store config. Returns client-map."
+  "Open a qdrant client from store config. Returns client-map. Throws when
+   the server is connected and silent (see `deadline/open-client`)."
   [{:keys [host port api-key tls?]}]
-  (q-client/make {:host    (or host "localhost")
-                  :port    (or port 6334)
-                  :api-key api-key
-                  :tls?    (boolean tls?)}))
+  (deadline/open-client {:host    (or host "localhost")
+                         :port    (or port 6334)
+                         :api-key api-key
+                         :tls?    (boolean tls?)}))
 
 (defn- ensure-payload-indexes!
   "Create payload indexes used by query-entries. Idempotent — soft-fails
@@ -340,11 +342,15 @@
 (defn- collection-exists?
   "Boundary: IO — ask qdrant whether COLLECTION-NAME exists. true/false is
    the server's answer; nil means the probe itself failed (threw, or did not
-   answer within `exists-probe-timeout-ms`), so the caller cannot tell."
-  [{:keys [client]} collection-name]
+   answer within `exists-probe-timeout-ms`), so the caller cannot tell.
+
+   The probe RPC carries that budget as its gRPC deadline, so an unanswered
+   probe is cancelled rather than left in flight behind the timed-out `.get`."
+  [client-map collection-name]
   (try
-    (boolean (.get ^java.util.concurrent.Future (.collectionExistsAsync client collection-name)
-                   exists-probe-timeout-ms java.util.concurrent.TimeUnit/MILLISECONDS))
+    (let [client (:client (deadline/bounded client-map exists-probe-timeout-ms))]
+      (boolean (.get ^java.util.concurrent.Future (.collectionExistsAsync client collection-name)
+                     exists-probe-timeout-ms java.util.concurrent.TimeUnit/MILLISECONDS)))
     (catch Throwable t
       (log/debug "collection-exists? probe failed:" (ex-message t))
       nil)))
@@ -625,7 +631,7 @@
     (resilient
      (fn []
        (if-let [c @client-atom]
-         (let [res (q-api/get-points c
+         (let [res (q-api/get-points (deadline/read-client c config)
                                      :collection (:collection-name config default-collection)
                                      :ids [(->uuid-id id)])]
            (some-> (first (:points res)) q-api/point->map point->entry (assoc :id id)))
@@ -686,7 +692,7 @@
       (if-let [c @client-atom]
         (resilient
          (fn []
-           (-> (scroll-collection! c collection-name limit
+           (-> (scroll-collection! (deadline/read-client c config) collection-name limit
                                    (build-must-keyword opts)
                                    (build-payload-keys opts))
                :points
@@ -725,7 +731,7 @@
 
              :else
              (let [r    (q-api/search-points
-                         c
+                         (deadline/search-client c config)
                          :collection (:collection-name config default-collection)
                          :vector (:vector rv)
                          :limit limit
@@ -782,7 +788,7 @@
               filter-opts (cond-> {:must-keyword and-keys}
                             (seq any-keys) (assoc :must-match-any any-keys))
               resp         (scroll-collection!
-                            c
+                            (deadline/read-client c config)
                             (:collection-name config default-collection)
                             1
                             filter-opts
@@ -831,7 +837,7 @@
         (resilient
          (fn []
            (if-let [c @(:client-atom this)]
-             (let [res (q-api/get-points c
+             (let [res (q-api/get-points (deadline/read-client c (:config this))
                                          :collection (:collection-name (:config this) default-collection)
                                          :ids (mapv ->uuid-id ids))]
                (into [] (keep #(some-> % q-api/point->map point->entry)) (:points res)))
@@ -944,7 +950,7 @@
          (fn []
            (if-let [c @client-atom]
              (let [coll (:collection-name config default-collection)
-                   res  (q-api/get-points c :collection coll :ids [(->uuid-id id)])
+                   res  (q-api/get-points (deadline/read-client c config) :collection coll :ids [(->uuid-id id)])
                    rp   (first (:points res))
                    v    (some-> rp retrieved-vector)]
                (when rp
@@ -995,9 +1001,12 @@
 
 (defn- scan-ids!
   "Boundary: IO — every entry id in the collection, each once, from a scroll
-   that agrees with qdrant's exact count (see `stable-scroll`)."
+   that agrees with qdrant's exact count (see `stable-scroll`).
+
+   CLIENT is the read view the caller built (`deadline/read-client`), so the
+   count is called reflectively: a QdrantClient hint would reject the view."
   [client collection-name include-expired?]
-  (let [^io.qdrant.client.QdrantClient qc (:client client)
+  (let [qc     (:client client)
         points (stable-scroll
                 #(.get (.countAsync qc ^String collection-name nil true))
                 #(:points (q-api/scroll-points client
@@ -1017,7 +1026,9 @@
     p
     {:scan-ids (fn [{:keys [config client-atom fallback-atom]} {:keys [include-expired?]}]
                  (if-let [c @client-atom]
-                   (scan-ids! c (:collection-name config default-collection) include-expired?)
+                   (scan-ids! (deadline/read-client c config)
+                              (:collection-name config default-collection)
+                              include-expired?)
                    (let [now (java.time.Instant/now)]
                      (->> (vals (:entries @fallback-atom))
                           (remove #(and (not include-expired?) (expired-at? (:expires %) now)))

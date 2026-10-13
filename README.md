@@ -43,6 +43,7 @@ to the core.
 | `hive-qdrant.queue` | JVM-wide write queue; on `:open` mutations enqueue rather than error, reads return a degraded response |
 | `hive-qdrant.failure` | Closed `:error/*` taxonomy plus translation to the legacy `{:success? false :errors […]}` shape |
 | `hive-qdrant.config` | Typed env wiring — host, port, api-key, TLS. Only the connection surface is operator-tunable |
+| `hive-qdrant.deadline` | Per-call gRPC deadline on every read RPC: 15 s for retrieve, scroll and count, 60 s for search (`QDRANT_READ_DEADLINE_MS`, `QDRANT_SEARCH_DEADLINE_MS`). A stalled store ends the call, and frees its thread, with `DEADLINE_EXCEEDED`. Writes carry none |
 | `hive-qdrant.migrate` | Chroma / Milvus → Qdrant migration, with the extraction step behind a pluggable `:source-fn` |
 | `hive-qdrant.addon` | `IAddon` registration (host-side, not shipped) |
 | `hive-qdrant.lifecycle` | `IShutdownHook`, priority 210 — the client band (host-side, not shipped) |
