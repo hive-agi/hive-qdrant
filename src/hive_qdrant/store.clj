@@ -35,9 +35,11 @@
             [clojure.string :as str]
             [hive-spi.memory.ports :as proto]
             [hive-qdrant.circuit :as circuit]
+            [hive-qdrant.deadline :as deadline]
             [hive-qdrant.failure :as failure]
             [hive-qdrant.queue :as queue]
-            [taoensso.timbre :as log])
+            [taoensso.timbre :as log]
+            [hive-qdrant.connect :as connect])
   (:import [java.util UUID]))
 
 ;; =============================================================================
@@ -309,70 +311,15 @@
 ;; Connection wrapper
 ;; =============================================================================
 
-(defn- open-client!
-  "Open a clj-qdrant client from store config. Returns client-map."
-  [{:keys [host port api-key tls?]}]
-  (q-client/make {:host    (or host "localhost")
-                  :port    (or port 6334)
-                  :api-key api-key
-                  :tls?    (boolean tls?)}))
-
-(defn- ensure-payload-indexes!
-  "Create payload indexes used by query-entries. Idempotent — soft-fails
-   when an index already exists. Required fields: tags (keyword), type
-   (keyword), project-id (keyword), content-hash (keyword)."
-  [client-map collection-name]
-  (doseq [[field type] [[:tags :keyword]
-                        [:type :keyword]
-                        [:project-id :keyword]
-                        [:content-hash :keyword]]]
-    (try
-      (q-schema/payload-index-create! client-map
-                                      {:collection collection-name
-                                       :field      (name field)
-                                       :type       type})
-      (catch Throwable t
-        (log/debug "payload-index-create! soft-failed for" field
-                   "(likely already exists):" (ex-message t))))))
-
-(def ^:private ^:const exists-probe-timeout-ms 5000)
-
-(defn- collection-exists?
-  "Boundary: IO — ask qdrant whether COLLECTION-NAME exists. true/false is
-   the server's answer; nil means the probe itself failed (threw, or did not
-   answer within `exists-probe-timeout-ms`), so the caller cannot tell."
-  [{:keys [client]} collection-name]
-  (try
-    (boolean (.get ^java.util.concurrent.Future (.collectionExistsAsync client collection-name)
-                   exists-probe-timeout-ms java.util.concurrent.TimeUnit/MILLISECONDS))
-    (catch Throwable t
-      (log/debug "collection-exists? probe failed:" (ex-message t))
-      nil)))
+(def ^:private open-client! connect/open!)
 
 (defn- ensure-collection!
-  "Create the collection if missing + ensure payload indexes.
-
-   Probes `collection-exists?` first so a reconnect against an existing
-   collection never sends a create (whose ALREADY_EXISTS the java client
-   logs at ERROR with a stack trace). When the probe answers false, or
-   fails (nil), it falls back to create-and-swallow: a concurrent creator
-   may still win the race, and that 'already exists' stays benign."
-  [client-map {:keys [collection-name vector-size distance]
-               :or   {collection-name default-collection
-                      vector-size     default-vector-size
-                      distance        :cosine}}]
-  (let [coll (or collection-name default-collection)]
-    (when-not (true? (collection-exists? client-map coll))
-      (try
-        (q-schema/collection-create! client-map
-                                     {:name        coll
-                                      :vector-size vector-size
-                                      :distance    distance})
-        (catch Throwable t
-          (log/debug "collection-create! soft-failed (likely already exists):"
-                     (ex-message t))
-          nil)))
-    (ensure-payload-indexes! client-map coll)))
+  "`connect/ensure-collection!` with the store's defaults under CFG."
+  [client-map cfg]
+  (connect/ensure-collection!
+   client-map
+   (merge {:collection-name default-collection :vector-size default-vector-size}
+          (into {} (filter (comp some? val)) cfg))))
 
 ;; =============================================================================
 ;; Resilient wrapper — circuit + queue
@@ -536,7 +483,7 @@
     (try
       (let [resolved (merge config cfg)
             client   (open-client! resolved)]
-        (ensure-collection! client resolved)
+        (try (ensure-collection! client resolved) (catch Throwable t (try (q-client/close! client) (catch Throwable _ nil)) (throw t)))
         (reset! client-atom client)
         (reset! connected?-atom true)
         (circuit/force-reset!)
@@ -600,7 +547,7 @@
                (let [v     (or (:vector rv)
                                (do (warn-unembedded! coll) (zero-vec vs)))
                      point (entry->point entry+id v)]
-                 (q-api/upsert-points c :collection coll :points [point])
+                 (q-api/upsert-points (deadline/write-client c config) :collection coll :points [point])
                  ;; Contract: return the id string (not the {:success? true ...} map)
                  ;; — matches hive-milvus/hive-chroma so the crud write path's
                  ;; `(string? raw-id)` guard accepts the result.
@@ -625,7 +572,7 @@
     (resilient
      (fn []
        (if-let [c @client-atom]
-         (let [res (q-api/get-points c
+         (let [res (q-api/get-points (deadline/read-client c config)
                                      :collection (:collection-name config default-collection)
                                      :ids [(->uuid-id id)])]
            (some-> (first (:points res)) q-api/point->map point->entry (assoc :id id)))
@@ -667,9 +614,7 @@
     (resilient
      (fn []
        (if-let [c @client-atom]
-         (do (q-api/delete-points c
-                                  :collection (:collection-name config default-collection)
-                                  :ids [(->uuid-id id)])
+         (do (q-api/delete-points (deadline/write-client c config) :collection (:collection-name config default-collection) :ids [(->uuid-id id)])
              true)
          (do (swap! fallback-atom update :entries dissoc id)
              true)))
@@ -686,7 +631,7 @@
       (if-let [c @client-atom]
         (resilient
          (fn []
-           (-> (scroll-collection! c collection-name limit
+           (-> (scroll-collection! (deadline/read-client c config) collection-name limit
                                    (build-must-keyword opts)
                                    (build-payload-keys opts))
                :points
@@ -725,7 +670,7 @@
 
              :else
              (let [r    (q-api/search-points
-                         c
+                         (deadline/search-client c config)
                          :collection (:collection-name config default-collection)
                          :vector (:vector rv)
                          :limit limit
@@ -782,7 +727,7 @@
               filter-opts (cond-> {:must-keyword and-keys}
                             (seq any-keys) (assoc :must-match-any any-keys))
               resp         (scroll-collection!
-                            c
+                            (deadline/read-client c config)
                             (:collection-name config default-collection)
                             1
                             filter-opts
@@ -831,7 +776,7 @@
         (resilient
          (fn []
            (if-let [c @(:client-atom this)]
-             (let [res (q-api/get-points c
+             (let [res (q-api/get-points (deadline/read-client c (:config this))
                                          :collection (:collection-name (:config this) default-collection)
                                          :ids (mapv ->uuid-id ids))]
                (into [] (keep #(some-> % q-api/point->map point->entry)) (:points res)))
@@ -944,7 +889,7 @@
          (fn []
            (if-let [c @client-atom]
              (let [coll (:collection-name config default-collection)
-                   res  (q-api/get-points c :collection coll :ids [(->uuid-id id)])
+                   res  (q-api/get-points (deadline/read-client c config) :collection coll :ids [(->uuid-id id)])
                    rp   (first (:points res))
                    v    (some-> rp retrieved-vector)]
                (when rp
@@ -955,8 +900,7 @@
                    ;; may carry in its raw payload.
                    (let [payload (:payload (q-api/point->map rp))
                          merged  (strip-transient (merge payload updates {:id id}))]
-                     (q-api/upsert-points c :collection coll
-                                          :points [(entry->point merged v)])
+                     (q-api/upsert-points (deadline/write-client c config) :collection coll :points [(entry->point merged v)])
                      merged)
                    ;; No vector came back: the honest write is the embedding one.
                    (proto/update-entry! this id updates))))
@@ -995,9 +939,12 @@
 
 (defn- scan-ids!
   "Boundary: IO — every entry id in the collection, each once, from a scroll
-   that agrees with qdrant's exact count (see `stable-scroll`)."
+   that agrees with qdrant's exact count (see `stable-scroll`).
+
+   CLIENT is the read view the caller built (`deadline/read-client`), so the
+   count is called reflectively: a QdrantClient hint would reject the view."
   [client collection-name include-expired?]
-  (let [^io.qdrant.client.QdrantClient qc (:client client)
+  (let [qc     (:client client)
         points (stable-scroll
                 #(.get (.countAsync qc ^String collection-name nil true))
                 #(:points (q-api/scroll-points client
@@ -1017,7 +964,9 @@
     p
     {:scan-ids (fn [{:keys [config client-atom fallback-atom]} {:keys [include-expired?]}]
                  (if-let [c @client-atom]
-                   (scan-ids! c (:collection-name config default-collection) include-expired?)
+                   (scan-ids! (deadline/read-client c config)
+                              (:collection-name config default-collection)
+                              include-expired?)
                    (let [now (java.time.Instant/now)]
                      (->> (vals (:entries @fallback-atom))
                           (remove #(and (not include-expired?) (expired-at? (:expires %) now)))

@@ -129,8 +129,7 @@
                                 (select-keys config [:vector-size :distance]))
                 embedder (make-embedder (:embed-type config))
                 store    (store/create-store
-                          (cond-> (select-keys resolved [:host :port :collection-name
-                                                         :api-key :tls? :vector-size :distance])
+                          (cond-> (select-keys resolved [:host :port :collection-name :api-key :tls? :vector-size :distance :read-deadline-ms :search-deadline-ms :write-deadline-ms])
                             embedder (assoc :embedder embedder)))
                 result   (mem-proto/connect! store resolved)]
             (if (:success? result)
