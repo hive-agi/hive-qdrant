@@ -24,7 +24,12 @@
      QDRANT_HOST    — gRPC/HTTP host                (default: localhost)
      QDRANT_PORT    — gRPC port                     (default: 6334)
      QDRANT_API_KEY — bearer token, optional        (default: nil)
-     QDRANT_TLS     — enable TLS (bool coercion)    (default: false)"
+     QDRANT_TLS     — enable TLS (bool coercion)    (default: false)
+     QDRANT_READ_DEADLINE_MS:   gRPC deadline of a read RPC, ms   (default: 15000)
+     QDRANT_SEARCH_DEADLINE_MS: gRPC deadline of a search RPC, ms (default: 60000)
+
+   The two deadlines are read by hive-qdrant.deadline, which bounds every
+   read RPC the store sends; writes carry none."
   (:require [hive-di.core :refer [defconfig env literal]]))
 
 (defconfig QdrantConfig
@@ -45,5 +50,22 @@
                         :default false
                         :type :bool
                         :doc "Enable TLS on the client connection.")
+  ;; The deadlines are :string on purpose. An :int field that fails to
+  ;; coerce fails the whole resolution, and with it the addon's initialize!:
+  ;; a typo in a tuning knob would keep the store from starting. The value is
+  ;; handed over as written and hive-qdrant.deadline parses it, falling back
+  ;; to the default (and saying so) when it is unusable.
+  :read-deadline-ms (env "QDRANT_READ_DEADLINE_MS"
+                         :default 15000
+                         :type :string
+                         :doc "gRPC deadline of a retrieve, scroll or count RPC, in ms.")
+  :search-deadline-ms (env "QDRANT_SEARCH_DEADLINE_MS"
+                           :default 60000
+                           :type :string
+                           :doc "gRPC deadline of a search RPC, in ms.")
+  :write-deadline-ms (env "QDRANT_WRITE_DEADLINE_MS"
+                          :default 30000
+                          :type :string
+                          :doc "gRPC deadline of an upsert, delete or create RPC, in ms.")
   :collection-name (literal "hive_qdrant_memory"
                             :doc "Default collection — overridable via addon config."))
