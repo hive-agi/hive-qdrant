@@ -40,7 +40,9 @@
             [hive-qdrant.queue :as queue]
             [taoensso.timbre :as log]
             [hive-qdrant.connect :as connect])
-  (:import [java.util UUID]))
+  (:import [io.qdrant.client WithPayloadSelectorFactory]
+           [io.qdrant.client.grpc Points$ScrollPoints]
+           [java.util List UUID]))
 
 ;; =============================================================================
 ;; Config + state
@@ -920,26 +922,99 @@
 
 (def ^:private scan-attempts 5)
 
+(def ^:private scan-page-size
+  "Points per scroll RPC of `scan-ids!`. Each page is its own gRPC call under
+   the read deadline, so a large collection is never one unbounded response."
+  512)
+
+(def ^:private scan-backoff-base-ms 250)
+(def ^:private scan-backoff-cap-ms 8000)
+
+(defn- drift-backoff-ms
+  "Mechanism: pure — how long to wait after the Nth (1-based) scroll that
+   disagreed with the count: base * 2^(n-1), capped. A collection that is
+   being written to needs room to settle, so each retry waits twice as long
+   as the last instead of hammering it at a fixed rate."
+  [n]
+  (min scan-backoff-cap-ms
+       (* scan-backoff-base-ms (bit-shift-left 1 (min 20 (max 0 (dec (long n))))))))
+
+(defn- within-drift?
+  "Mechanism: pure — true when SCROLLED lies between the counts taken
+   BEFORE and AFTER a scroll. A collection being written moves while it is
+   read, so an id-ordered paged scroll of it may see some of the points that
+   came or went meanwhile, never fewer than were there throughout (min) nor
+   more than were ever there (max). Outside that band the scroll lost or
+   doubled points."
+  [before after scrolled]
+  (<= (min before after) scrolled (max before after)))
+
 (defn- stable-scroll
-  "Mechanism: pure over `count!` and `scroll!` — points from a scroll that
-   both a count before it and a count after it agree with. A collection that
-   moved during the scroll is read again; after `attempts` tries it raises,
-   so a moving or lossy scroll never passes for the whole collection."
-  [count! scroll! attempts]
-  (loop [n 1]
-    (let [before (long (count!))
-          points (scroll!)
-          after  (long (count! ))]
+  "Mechanism: over `count!`, `scroll!` and `sleep!` — points from a scroll
+   checked against a count before it and a count after it.
+
+   A scroll both counts agree with is the whole collection and is answered
+   at once. One that disagrees is read again after a growing pause (see
+   `drift-backoff-ms`). When the attempts run out, a collection that never
+   stood still is answered with the last scroll if it is `within-drift?` of
+   its counts: a live collection under steady writes never holds still, and
+   its id-ordered snapshot is the honest answer. A scroll outside that band
+   raises, so a lossy scroll never passes for the whole collection."
+  ([count! scroll! attempts]
+   (stable-scroll count! scroll! attempts #(Thread/sleep (long %))))
+  ([count! scroll! attempts sleep!]
+   (loop [n 1]
+     (let [before   (long (count!))
+           points   (scroll!)
+           after    (long (count!))
+           scrolled (count points)]
+       (cond
+         (= before after scrolled) points
+         (< n attempts)            (do (sleep! (drift-backoff-ms n)) (recur (inc n)))
+         (and (not= before after)
+              (within-drift? before after scrolled))
+         (do (log/warn "hive-qdrant: scan-ids answered a drifting snapshot"
+                       {:attempts n :before before :after after :scrolled scrolled})
+             points)
+         :else
+         (throw (ex-info "qdrant scroll never matched the collection's exact count"
+                         {:attempts n :before before :after after :scrolled scrolled})))))))
+
+(defn- page-through
+  "Mechanism: pure over `fetch!` — every point of a paged scroll.
+   FETCH! is (fn [offset]) -> {:points [..] :next-offset id-or-nil}, called
+   with nil for the first page. Stops at the first page with no next offset
+   or no points. An offset that does not advance would loop forever, so it
+   raises."
+  [fetch!]
+  (loop [offset nil
+         acc    []]
+    (let [{:keys [points next-offset]} (fetch! offset)
+          acc' (into acc points)]
       (cond
-        (= before after (count points)) points
-        (< n attempts)                  (do (Thread/sleep 1000) (recur (inc n)))
-        :else
-        (throw (ex-info "qdrant scroll never matched the collection's exact count"
-                        {:attempts n :before before :after after :scrolled (count points)}))))))
+        (not (and next-offset (seq points))) acc'
+        (= next-offset offset)               (throw (ex-info "qdrant scroll offset did not advance"
+                                                             {:offset offset :scrolled (count acc')}))
+        :else                                (recur next-offset acc')))))
+
+(defn- scroll-page!
+  "Boundary: IO — one page of at most `scan-page-size` points from OFFSET
+   (nil for the first), carrying only the payload fields in FIELDS. CLIENT is
+   the read view, so the call is reflective."
+  [client collection-name offset fields]
+  (let [qc (:client client)
+        b  (-> (Points$ScrollPoints/newBuilder)
+               (.setCollectionName ^String collection-name)
+               (.setLimit (int scan-page-size))
+               (.setWithPayload (WithPayloadSelectorFactory/include ^List (vec fields))))
+        _  (when offset (.setOffset b offset))
+        resp (.get (.scrollAsync qc (.build b)))]
+    {:points      (mapv q-api/point->map (.getResultList resp))
+     :next-offset (when (.hasNextPageOffset resp) (.getNextPageOffset resp))}))
 
 (defn- scan-ids!
-  "Boundary: IO — every entry id in the collection, each once, from a scroll
-   that agrees with qdrant's exact count (see `stable-scroll`).
+  "Boundary: IO — every entry id in the collection, each once, from a paged
+   scroll that agrees with qdrant's exact count (see `stable-scroll`).
 
    CLIENT is the read view the caller built (`deadline/read-client`), so the
    count is called reflectively: a QdrantClient hint would reject the view."
@@ -947,10 +1022,8 @@
   (let [qc     (:client client)
         points (stable-scroll
                 #(.get (.countAsync qc ^String collection-name nil true))
-                #(:points (q-api/scroll-points client
-                                               :collection collection-name
-                                               :limit Integer/MAX_VALUE
-                                               :payload-includes ["id" "expires"]))
+                #(page-through (fn [offset]
+                                 (scroll-page! client collection-name offset ["id" "expires"])))
                 scan-attempts)
         now    (java.time.Instant/now)]
     (->> points

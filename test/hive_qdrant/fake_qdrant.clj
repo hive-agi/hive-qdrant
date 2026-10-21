@@ -25,7 +25,8 @@
      (reset! (:connected?-atom store) true)"
   (:import [io.qdrant.client.grpc Collections$CreateCollection
             Points$DenseVector Points$PointStruct
-            Points$RetrievedPoint Points$ScoredPoint Points$SearchPoints
+            Points$RetrievedPoint Points$ScoredPoint Points$ScrollPoints
+            Points$ScrollResponse Points$SearchPoints
             Points$VectorOutput Points$VectorsOutput]
            [java.util List]
            [java.util.concurrent CompletableFuture]))
@@ -34,6 +35,8 @@
   (upsertAsync [collection points])
   (retrieveAsync [collection ids withPayload withVectors consistency])
   (searchAsync [request])
+  (scrollAsync [request])
+  (countAsync [collection filter exact])
   (deleteAsync [collection ids-or-filter])
   (collectionExistsAsync [collection])
   (createCollectionAsync [request])
@@ -110,6 +113,32 @@
                  (sort-by second >)
                  (take (.getLimit req))
                  (mapv (fn [[ps s]] (scored ps s)))))))
+  (scrollAsync [_ request]
+    ;; Pages the stored points in key order from the request's offset,
+    ;; honouring the payload include selector. Like search, it ignores the
+    ;; request's filter: a paging oracle, not a filter oracle.
+    (let [^Points$ScrollPoints req request
+          sorted (sort-by key @store)
+          offset (when (.hasOffset req) (point-key (.getOffset req)))
+          after  (if offset (drop-while #(not= offset (key %)) sorted) sorted)
+          after  (if offset (rest after) after)
+          page   (take (.getLimit req) after)
+          more   (seq (drop (.getLimit req) after))
+          sel    (.getWithPayload req)
+          fields (when (and (.hasInclude sel) (seq (.. sel getInclude getFieldsList)))
+                   (set (.. sel getInclude getFieldsList)))
+          b      (Points$ScrollResponse/newBuilder)]
+      (doseq [[_ ^Points$PointStruct ps] page]
+        (let [pb (-> (Points$RetrievedPoint/newBuilder) (.setId (.getId ps)))]
+          (doseq [[k v] (.getPayloadMap ps)
+                  :when (or (nil? fields) (contains? fields k))]
+            (.putPayload pb k v))
+          (.addResult b (.build pb))))
+      (when more
+        (.setNextPageOffset b (.getId ^Points$PointStruct (val (last page)))))
+      (done (.build b))))
+  (countAsync [_ _collection _filter _exact]
+    (done (long (count @store))))
   (deleteAsync [_ _collection ids-or-filter]
     (when (instance? List ids-or-filter)
       (swap! store #(apply dissoc % (map point-key ids-or-filter))))
@@ -156,6 +185,8 @@
       (upsertAsync [_ _ _] (boom))
       (retrieveAsync [_ _ _ _ _ _] (boom))
       (searchAsync [_ _] (boom))
+      (scrollAsync [_ _] (boom))
+      (countAsync [_ _ _ _] (boom))
       (deleteAsync [_ _ _] (boom))
       (collectionExistsAsync [_ _] (boom))
       (createCollectionAsync [_ _] (boom))
@@ -174,6 +205,8 @@
     (retrieveAsync [_ collection ids with-payload with-vectors consistency]
       (.retrieveAsync c collection ids with-payload with-vectors consistency))
     (searchAsync [_ request] (.searchAsync c request))
+    (scrollAsync [_ request] (.scrollAsync c request))
+    (countAsync [_ collection filter exact] (.countAsync c collection filter exact))
     (deleteAsync [_ collection ids-or-filter] (.deleteAsync c collection ids-or-filter))
     (collectionExistsAsync [_ collection] (.collectionExistsAsync c collection))
     (createCollectionAsync [_ request] (.createCollectionAsync c request))
