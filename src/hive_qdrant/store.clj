@@ -474,6 +474,30 @@
 ;; Store record
 ;; =============================================================================
 
+(defn- health-report
+  "Health of a store whose connected flag is CONNECTED? and whose client-map
+   is CLIENT-MAP, for collection COLLECTION. Healthy only when connected AND
+   the collection exists: a reachable qdrant with no collection is not usable.
+   :errors names why it is not healthy."
+  [connected? client-map collection]
+  (let [unreached? (false? (:reached? client-map))
+        exists?    (when (and connected? client-map (not unreached?))
+                     (connect/collection-exists? client-map collection))
+        healthy?   (boolean (and connected? (true? exists?)))
+        errors     (cond
+                     (not connected?)  ["Not connected"]
+                     (nil? client-map) ["No client"]
+                     unreached?        ["qdrant unreachable"]
+                     (nil? exists?)    ["exists probe failed"]
+                     (false? exists?)  ["Collection does not exist"]
+                     :else             [])]
+    {:healthy?   healthy?
+     :status     (if healthy? :ok :down)
+     :backend    "qdrant"
+     :collection collection
+     :errors     errors
+     :circuit    (:state (circuit/state))}))
+
 (defrecord QdrantMemoryStore
   [config client-atom fallback-atom connected?-atom]
 
@@ -507,11 +531,9 @@
   (connected? [_this] (boolean @connected?-atom))
 
   (health-check [_this]
-    (let [connected? @connected?-atom]
-      {:healthy? connected?
-       :status   (if connected? :ok :down)
-       :backend  "qdrant"
-       :circuit  (:state (circuit/state))}))
+    (health-report (boolean @connected?-atom)
+                   @client-atom
+                   (:collection-name config default-collection)))
 
   ;; ---- CRUD ----------------------------------------------------------------
 
