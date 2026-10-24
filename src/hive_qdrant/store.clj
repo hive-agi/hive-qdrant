@@ -788,6 +788,47 @@
           (log/warn "reset-store! recreate failed:" (ex-message t)))))
     {:success? true}))
 
+;; =============================================================================
+;; IMemoryStoreBatchDelete — one points-delete for an id list
+;; =============================================================================
+;;
+;; Resolved by name: hive-spi builds without the port load this namespace
+;; unchanged. The live branch sends ONE points-delete carrying every id, under
+;; the same circuit as delete-entry!. When that round trip fails, each id
+;; falls back to delete-entry!, which classifies and queues it for replay
+;; exactly as a single delete would, so a batch never loses a delete the
+;; single path would have kept.
+
+(def ^:private proto-batch-delete
+  (some-> (ns-resolve 'hive-spi.memory.ports 'IMemoryStoreBatchDelete) deref))
+
+(defn- delete-batch!
+  "One delete-entry! result per distinct id of IDS, in first-seen order."
+  [{:keys [config client-atom fallback-atom] :as this} ids]
+  (let [ids (into [] (comp (remove nil?) (distinct)) ids)]
+    (cond
+      (empty? ids) []
+
+      (nil? @client-atom)
+      (do (swap! fallback-atom update :entries #(apply dissoc % ids))
+          (mapv (constantly true) ids))
+
+      :else
+      (let [r (resilient
+               (fn []
+                 (q-api/delete-points (deadline/write-client @client-atom config)
+                                      :collection (:collection-name config default-collection)
+                                      :ids (mapv ->uuid-id ids))
+                 true))]
+        (if (true? r)
+          (mapv (constantly true) ids)
+          (mapv #(proto/delete-entry! this %) ids))))))
+
+(when proto-batch-delete
+  (extend QdrantMemoryStore
+    proto-batch-delete
+    {:delete-entries! delete-batch!}))
+
 (extend-protocol proto/IMemoryStoreBatch
   QdrantMemoryStore
   (get-entries [this ids]
