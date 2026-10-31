@@ -588,7 +588,7 @@
        ;; The queued op keeps :embed-text. The queue lives in RAM only, and
        ;; its replay runs back through add-entry!, which must embed that text
        ;; and not the (possibly sealed) :content.
-       {:op :add-entry! :id entry-id :args [entry+id]})))
+       {:op :add-entry! :id entry-id :args [entry+id] :collection (:collection-name config default-collection)})))
 
   (get-entry [_this id]
     ;; q-api/get-points returns RAW protobuf points; the clj-qdrant
@@ -632,7 +632,7 @@
 
         (read-failure? existing)
         (if (:reconnecting? existing)
-          (queue/enqueue! {:op :update-entry! :id id :args [id updates]})
+          (queue/enqueue! {:op :update-entry! :id id :args [id updates] :collection (:collection-name config default-collection)})
           existing)
 
         :else
@@ -648,7 +648,7 @@
              true)
          (do (swap! fallback-atom update :entries dissoc id)
              true)))
-     {:op :delete-entry! :id id :args [id]}))
+     {:op :delete-entry! :id id :args [id] :collection (:collection-name config default-collection)}))
 
   (query-entries
     ;; Intent layer (SLAP): single-pipeline orchestration.
