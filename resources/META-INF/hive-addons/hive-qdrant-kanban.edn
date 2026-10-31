@@ -23,7 +23,8 @@
                       :registry-key    :kanban
                       :embed-type      :kanban
                       :vector-size     2560
-                      :distance        :cosine}
+                      :distance        :cosine
+                      :outbox? true}
  :addon/capabilities #{:vector-search :health-reporting}
  :addon/dependencies #{}
  :addon/description  "Qdrant vector DB backend for :kanban IMemoryStore slot (kanban tasks — decouples from milvus hot path)."
