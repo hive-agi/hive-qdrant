@@ -68,8 +68,10 @@
         "queued, as every write under an open circuit is")
     (is (= ["t1"] (:tags (fake/payload c "u1"))) "nothing is written while open")
     (testing "the queue holds the updates alone, never a merged failure map"
-      (is (= [{:op :update-entry! :id "u1" :args ["u1" {:tags ["t2"]}]}]
-             (replay! s))))
+      (is (= [{:op :update-entry! :id "u1" :args ["u1" {:tags ["t2"]}]
+               :collection "test-update-entry"}]
+             (replay! s))
+          "a queued op names its collection: the queue is shared by every store slot"))
     (let [p (fake/payload c "u1")]
       (is (= "keep me" (:content p)) "the replay merged onto the stored entry")
       (is (= ["t2"] (:tags p)))
