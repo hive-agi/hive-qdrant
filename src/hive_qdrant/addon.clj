@@ -43,7 +43,10 @@
             [hive-qdrant.store :as store]
             [taoensso.timbre :as log]
             [hive-addon.protocol :as addon-proto]
-            [hive-addon.host :as host]))
+            [hive-addon.host :as host]
+            [hive-qdrant.queue :as queue]
+            [hive-qdrant.circuit :as circuit]
+            [hive-qdrant.outbox :as outbox]))
 
 ;; =============================================================================
 ;; Host services
@@ -100,6 +103,50 @@
             (log/debug "carto embed failed (degrading to zero-vec):" (ex-message t))
             nil))))))
 
+(defn- drain-queue!
+  "Replay the shared write queue against every connected slot, off the
+   caller's thread. Fired when the circuit closes and after a slot attaches
+   an outbox that recovered writes from a previous process."
+  []
+  (future
+    (try
+      (queue/drain! {:dispatch-fn   queue/routed-dispatch
+                     :circuit-open? circuit/open?})
+      (catch Throwable t
+        (log/warn "hive-qdrant queue drain failed:" (ex-message t))))))
+
+(defonce ^:private drain-listener
+  (fn [] (drain-queue!)))
+
+(defn- outbox-path
+  "The outbox file for CONFIG, or nil when the queue stays in RAM.
+   :outbox-path names the file; :outbox? true takes the default path."
+  [config]
+  (or (not-empty (str (:outbox-path config)))
+      (when (:outbox? config) (outbox/default-path))))
+
+(defn- wire-replay!
+  "Route STORE's queued writes to it, mirror the queue to the configured
+   outbox, and drain on recovery. Returns the outbox summary, or nil."
+  [store collection config]
+  (queue/register-dispatcher! collection (queue/make-store-dispatch store))
+  (circuit/subscribe! drain-listener)
+  (let [summary (when-let [path (outbox-path config)]
+                  (queue/attach-outbox! (outbox/file-outbox path) path))]
+    (when (pos? (queue/size))
+      (drain-queue!))
+    summary))
+
+(defn- unwire-replay!
+  "Undo `wire-replay!` for COLLECTION. The drain listener goes once no slot
+   is left to replay into."
+  [collection]
+  (when collection
+    (queue/unregister-dispatcher! collection))
+  (when-not (queue/any-dispatcher?)
+    (circuit/unsubscribe! drain-listener))
+  nil)
+
 (defrecord QdrantAddon [store-atom slot-atom addon-id-atom]
   addon-proto/IAddon
 
@@ -133,7 +180,7 @@
                             embedder (assoc :embedder embedder)))
                 result   (mem-proto/connect! store resolved)]
             (if (:success? result)
-              (do
+              (let [outbox (wire-replay! store (:collection-name resolved) config)]
                 (reset! store-atom store)
                 (reset! slot-atom slot)
                 (mem-reg/register-store! slot store)
@@ -143,9 +190,11 @@
                            :port       (:port resolved)
                            :tls?       (:tls? resolved)
                            :collection (:collection-name resolved)
-                           :addon-id   @addon-id-atom})
-                {:success? true :errors [] :metadata {:backend "qdrant"
-                                                       :slot    slot}})
+                           :addon-id   @addon-id-atom
+                           :outbox     outbox})
+                {:success? true :errors [] :metadata (cond-> {:backend "qdrant"
+                                                              :slot    slot}
+                                                       outbox (assoc :outbox outbox))})
               {:success? false
                :errors   (:errors result)
                :metadata {:backend "qdrant"}}))))
@@ -157,6 +206,7 @@
   (shutdown! [_this]
     (when-let [store @store-atom]
       (try (mem-proto/disconnect! store) (catch Throwable _ nil))
+      (unwire-replay! (get-in store [:config :collection-name]))
       (mem-reg/unregister-store! @slot-atom)
       (reset! store-atom nil)
       (log/info "QdrantAddon shut down" {:slot @slot-atom :addon-id @addon-id-atom}))
