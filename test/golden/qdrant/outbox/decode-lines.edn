@@ -1,0 +1,6 @@
+{:blank {:ops [], :corrupt 0},
+ :empty {:ops [], :corrupt 0},
+ :not-an-op {:ops [], :corrupt 3},
+ :one-op
+ {:ops [{:op :delete-entry!, :id "a", :args ["a"]}], :corrupt 0},
+ :torn {:ops [{:op :delete-entry!, :id "a", :args ["a"]}], :corrupt 1}}

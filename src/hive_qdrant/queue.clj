@@ -12,7 +12,8 @@
    core.async bounded channel for single-writer serialization."
   (:require [clojure.core.async :as a]
             [hive-spi.memory.ports :as proto]
-            [taoensso.timbre :as log])
+            [taoensso.timbre :as log]
+            [hive-qdrant.outbox :as outbox])
   (:import [clojure.lang PersistentQueue]))
 
 ;; =============================================================================
@@ -41,16 +42,101 @@
          :drained-fail  0
          :drain-passes  0}))
 
+(def ^:private the-outbox
+  "The attached durable mirror: {:outbox IOutbox :path str :recovered n
+   :corrupt n}, or nil while the queue lives in RAM only."
+  (atom nil))
+
+(def ^:private dispatchers
+  "Collection name -> drain dispatch-fn, one per connected store slot."
+  (atom {}))
+
 (defn size [] (count @the-queue))
 (defn full? [] (>= (size) max-size))
 (defn drain-running? [] @draining?)
 
+(defn durable?
+  "True when an outbox is attached, so an accepted write survives a restart."
+  []
+  (some? @the-outbox))
+
 (defn stats []
-  (assoc @metrics :depth (size) :max-size max-size :draining? (drain-running?)))
+  (assoc @metrics
+         :depth     (size)
+         :max-size  max-size
+         :draining? (drain-running?)
+         :durable?  (durable?)
+         :outbox    (some-> @the-outbox (select-keys [:path :recovered :corrupt]))))
+
+(def ^:private disk-lock
+  "Held across every queue change that the outbox must mirror, so a rewrite
+   never reads the queue before an op lands and then moves its file over the
+   line that op appended."
+  (Object.))
+
+(defn- sync-outbox!
+  "Rewrite the attached outbox to hold exactly the ops queued now."
+  []
+  (locking disk-lock
+    (when-let [{ob :outbox} @the-outbox]
+      (outbox/rewrite! ob (vec @the-queue)))))
 
 (defn clear! []
   (reset! the-queue PersistentQueue/EMPTY)
+  (sync-outbox!)
   :cleared)
+
+(defn attach-outbox!
+  "Mirror the queue to OB (an hive-qdrant.outbox/IOutbox) kept at PATH.
+   The ops OB recorded are queued AHEAD of anything queued in this process:
+   they are older. Attaching the path already attached is a no-op, so every
+   store slot may ask for the same file. Returns the outbox summary
+   {:path :recovered :corrupt}."
+  [ob path]
+  (locking disk-lock
+    (if (= path (:path @the-outbox))
+      (select-keys @the-outbox [:path :recovered :corrupt])
+      (let [{:keys [ops corrupt]} (outbox/load-ops ob)]
+        (swap! the-queue #(into (into PersistentQueue/EMPTY ops) %))
+        (reset! the-outbox {:outbox ob :path path
+                            :recovered (count ops) :corrupt corrupt})
+        (sync-outbox!)
+        (when (seq ops)
+          (log/warn "hive-qdrant.queue recovered" (count ops)
+                    "queued write(s) from" path))
+        {:path path :recovered (count ops) :corrupt corrupt}))))
+
+(defn register-dispatcher!
+  "Route the queued ops of COLLECTION to DISPATCH-FN at drain time."
+  [collection dispatch-fn]
+  (swap! dispatchers assoc collection dispatch-fn)
+  collection)
+
+(defn unregister-dispatcher!
+  [collection]
+  (swap! dispatchers dissoc collection)
+  collection)
+
+(defn any-dispatcher?
+  "True while at least one store is registered to replay into."
+  []
+  (boolean (seq @dispatchers)))
+
+(defn routed-dispatch
+  "Drain dispatch-fn over every registered store: an op runs against the
+   store of its :collection. An op whose store is not connected throws, so
+   the drain keeps it queued (and on disk) for a later pass."
+  [op]
+  (if-let [dispatch (get @dispatchers (:collection op))]
+    (dispatch op)
+    (throw (ex-info "hive-qdrant.queue: no store registered for queued op"
+                    {:op (:op op) :collection (:collection op)}))))
+
+(defn detach-outbox!
+  "Stop mirroring to disk; the file is left as it is. Tests + shutdown."
+  []
+  (reset! the-outbox nil)
+  :detached)
 
 ;; =============================================================================
 ;; Enqueue
@@ -58,26 +144,46 @@
 
 (defn- now-ms [] (System/currentTimeMillis))
 
+(defn- persisted-tip
+  "The line that says whether a queued write outlives this process."
+  [spilled?]
+  (if spilled?
+    "NOT PERSISTED YET: spilled to the outbox on disk; a restart replays it."
+    "NOT PERSISTED YET: held in RAM only; a restart before qdrant returns LOSES it."))
+
 (defn enqueue!
   "Append op descriptor {:op kw :id str :args [..]}. Returns
    {:success? true :queued? true :depth N :tips [..]} on accept,
-   or {:success? false :error :queue-full :depth N :tips [..]} on overflow."
+   or {:success? false :error :queue-full :depth N :tips [..]} on overflow.
+
+   An accepted write is NOT in qdrant yet, and the answer says so:
+   :persisted? false and :status :queued-not-persisted. :spilled? is true
+   when the attached outbox recorded the op before this returned."
   [op]
   (let [op*       (assoc op :ts (now-ms))
-        [old new] (swap-vals! the-queue
-                              (fn [q]
-                                (if (>= (count q) max-size)
-                                  q
-                                  (conj q op*))))
+        [old new spilled?]
+        (locking disk-lock
+          (let [[old new] (swap-vals! the-queue
+                                      (fn [q]
+                                        (if (>= (count q) max-size)
+                                          q
+                                          (conj q op*))))]
+            [old new (boolean (when (> (count new) (count old))
+                                (when-let [{ob :outbox} @the-outbox]
+                                  (outbox/append! ob op*))))]))
         accepted? (> (count new) (count old))]
     (if accepted?
       (do (swap! metrics update :enqueued inc)
-          {:success? true
-           :queued?  true
-           :depth    (count new)
-           :tips     [(str "Write queued for replay (depth " (count new)
-                           "/" max-size ").")
-                      "Will drain automatically when qdrant reconnects."]})
+          {:success?   true
+           :queued?    true
+           :persisted? false
+           :spilled?   spilled?
+           :status     :queued-not-persisted
+           :depth      (count new)
+           :tips       [(str "Write queued for replay (depth " (count new)
+                             "/" max-size ").")
+                        (persisted-tip spilled?)
+                        "Will drain automatically when qdrant reconnects."]})
       (do (swap! metrics update :rejected-full inc)
           (log/warn "hive-qdrant.queue overflow, rejecting op" (:op op))
           {:success? false
@@ -123,11 +229,15 @@
 (defn- coalesce-key
   "Every op on one entry id shares a key, whatever the op: they fold in the
    order they were queued (`fold-op`). An op with no id (:cleanup-expired!)
-   keys on its op."
+   keys on its op.
+
+   The queue is one per process and every store slot shares it, so the key
+   also carries the op's :collection: one id in two collections is two
+   entries. An op queued without a :collection keys as before."
   [op]
   (if-let [id (:id op)]
-    [::entry id]
-    [::singleton (:op op)]))
+    [::entry (:collection op) id]
+    [::singleton (:collection op) (:op op)]))
 
 (defn- fold-updates
   "Two queued update-entry! UPDATES maps for one id, U1 then U2, as the one
@@ -206,7 +316,11 @@
 
 (defn- drain-pass!
   "One drain iteration. Single-writer: ops run sequentially through a
-   bounded core.async channel, bounded by drain-timeout-ms per item."
+   bounded core.async channel, bounded by drain-timeout-ms per item.
+
+   The attached outbox keeps the snapshot's ops until the pass settles and is
+   rewritten only then, to the failed ops plus whatever queued meanwhile: a
+   crash mid-pass replays the pass again rather than losing it."
   [dispatch-fn]
   (let [[snapshot _] (swap-vals! the-queue (constantly PersistentQueue/EMPTY))
         batch        (coalesce (vec snapshot))
@@ -226,10 +340,12 @@
                          acc))
         failed-ops   (into [] (keep (fn [[op r]] (when (not= r ::ok) op))) results)
         ok-cnt       (- (count batch) (count failed-ops))]
-    (when (seq failed-ops)
-      ;; Back AHEAD of anything queued while this pass ran: those ops are
-      ;; newer, and a failed op replayed after them would undo them.
-      (swap! the-queue #(into (into PersistentQueue/EMPTY failed-ops) %)))
+    (locking disk-lock
+      (when (seq failed-ops)
+        ;; Back AHEAD of anything queued while this pass ran: those ops are
+        ;; newer, and a failed op replayed after them would undo them.
+        (swap! the-queue #(into (into PersistentQueue/EMPTY failed-ops) %)))
+      (sync-outbox!))
     (swap! metrics (fn [m]
                      (-> m
                          (update :drained-ok + ok-cnt)

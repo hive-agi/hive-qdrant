@@ -425,12 +425,18 @@
   "Mechanism: pure opts → server-side payload projection list.
    Always projects kanban hot-path keys (id, content-hash, expires) so
    move/delete/dedupe paths work without :include-content?. The full
-   :content payload is opt-in to keep response size bounded."
-  [{:keys [include-content?]}]
-  (cond-> ["id" "type" "tags" "project-id"
-           "duration" "created-at" "created"
-           "updated" "content-hash" "expires"]
-    include-content? (conj "content")))
+   :content payload is opt-in to keep response size bounded.
+
+   :output-fields replaces that default with \"id\" plus the named fields,
+   and keeps \"tags\" when :exclude-tags needs it client-side."
+  [{:keys [include-content? output-fields exclude-tags]}]
+  (if (seq output-fields)
+    (cond-> (into ["id"] (comp (map name) (remove #{"id"}) (distinct)) output-fields)
+      (and (seq exclude-tags) (not-any? #{"tags"} (map name output-fields))) (conj "tags"))
+    (cond-> ["id" "type" "tags" "project-id"
+             "duration" "created-at" "created"
+             "updated" "content-hash" "expires"]
+      include-content? (conj "content"))))
 
 (defn- exclude-tagged
   "Mechanism: pure — drop points whose tags intersect any `exclude-tags`.
@@ -582,7 +588,7 @@
        ;; The queued op keeps :embed-text. The queue lives in RAM only, and
        ;; its replay runs back through add-entry!, which must embed that text
        ;; and not the (possibly sealed) :content.
-       {:op :add-entry! :id entry-id :args [entry+id]})))
+       {:op :add-entry! :id entry-id :args [entry+id] :collection (:collection-name config default-collection)})))
 
   (get-entry [_this id]
     ;; q-api/get-points returns RAW protobuf points; the clj-qdrant
@@ -626,7 +632,7 @@
 
         (read-failure? existing)
         (if (:reconnecting? existing)
-          (queue/enqueue! {:op :update-entry! :id id :args [id updates]})
+          (queue/enqueue! {:op :update-entry! :id id :args [id updates] :collection (:collection-name config default-collection)})
           existing)
 
         :else
@@ -642,7 +648,7 @@
              true)
          (do (swap! fallback-atom update :entries dissoc id)
              true)))
-     {:op :delete-entry! :id id :args [id]}))
+     {:op :delete-entry! :id id :args [id] :collection (:collection-name config default-collection)}))
 
   (query-entries
     ;; Intent layer (SLAP): single-pipeline orchestration.
@@ -1107,6 +1113,114 @@
                      (->> (vals (:entries @fallback-atom))
                           (remove #(and (not include-expired?) (expired-at? (:expires %) now)))
                           (mapv :id)))))}))
+
+;; =============================================================================
+;; IMemoryStoreCount / IMemoryStorePage: exact count, one page per call
+;; =============================================================================
+;;
+;; Resolved by name: hive-spi builds without the ports load this namespace
+;; unchanged. A caller that wanted a number used to read every row (carto's
+;; catchup count timed out at 15 s on a store of millions of points); here
+;; qdrant counts server-side and a walk holds one page per round trip.
+;;
+;; The live filter is query-entries' filter plus :exclude-tags as a
+;; must-not clause, so a count and a walk of the same opts agree. Expiry is
+;; not filterable server-side, so the live branch, like query-entries,
+;; ignores :include-expired?. A failure throws: never 0, never an empty page.
+
+(defn- live-filter
+  "Mechanism: pure. The Common$Filter for opts, or nil for match-all."
+  [{:keys [exclude-tags] :as opts}]
+  (let [f (cond-> (build-must-keyword opts)
+            (seq exclude-tags) (assoc :must-not-keyword {:tags (mapv str exclude-tags)}))]
+    (when (seq f) (q-api/->filter f))))
+
+(defn- guarded-read
+  "Run (thunk) under the circuit breaker; an open circuit or a failure
+   throws ex-info carrying OP."
+  [op thunk]
+  (when-let [gate (circuit/check)]
+    (throw (ex-info (str "qdrant " (name op) ": circuit open") {:op op :gate gate})))
+  (try
+    (let [r (thunk)]
+      (circuit/record-success!)
+      r)
+    (catch Throwable t
+      (circuit/record-failure!)
+      (throw (ex-info (str "qdrant " (name op) " failed: " (ex-message t))
+                      {:op op :failure (failure/->legacy-map (failure/classify t))}
+                      t)))))
+
+(defn- fallback-match?
+  "Mechanism: pure. Does in-memory ENTRY satisfy query-entries' filter
+   keys, evaluated as the live filter would plus expiry."
+  [{:keys [type tags project-id project-ids exclude-tags include-expired?]} now entry]
+  (let [etags (set (map str (:tags entry)))
+        pids  (->project-id-list project-id project-ids)]
+    (and (or (nil? type) (= (first (->type-token type)) (first (->type-token (:type entry)))))
+         (every? #(contains? etags (str %)) tags)
+         (not-any? #(contains? etags (str %)) exclude-tags)
+         (or (nil? pids) (some #{(str (:project-id entry))} pids))
+         (or include-expired? (not (expired-at? (:expires entry) now))))))
+
+(defn- fallback-matches
+  "Every in-memory entry matching OPTS, in id order."
+  [fallback-atom opts]
+  (let [now (java.time.Instant/now)]
+    (->> (vals (:entries @fallback-atom))
+         (filter #(fallback-match? opts now %))
+         (sort-by (comp str :id)))))
+
+(defn- project-row
+  "ROW cut to \"id\" plus the payload keys of `build-payload-keys`."
+  [opts row]
+  (select-keys row (map keyword (build-payload-keys opts))))
+
+(defn- count-live!
+  "Boundary: IO. Qdrant's exact count of the points matching OPTS."
+  [client collection-name opts]
+  (long (.get (.countAsync (:client client) ^String collection-name (live-filter opts) true))))
+
+(defn- page-live!
+  "Boundary: IO. One scroll page from CURSOR (nil starts the walk); the
+   cursor is qdrant's own next-page PointId, opaque to the caller."
+  [client collection-name {:keys [limit cursor] :or {limit 100} :as opts}]
+  (let [b (-> (Points$ScrollPoints/newBuilder)
+              (.setCollectionName ^String collection-name)
+              (.setLimit (int limit))
+              (.setWithPayload (WithPayloadSelectorFactory/include ^List (build-payload-keys opts))))
+        _ (when-let [f (live-filter opts)] (.setFilter b f))
+        _ (when cursor (.setOffset b cursor))
+        resp (.get (.scrollAsync (:client client) (.build b)))]
+    {:rows        (mapv (comp point->entry q-api/point->map) (.getResultList resp))
+     :next-cursor (when (.hasNextPageOffset resp) (.getNextPageOffset resp))}))
+
+(defn- count-entries*
+  [{:keys [config client-atom fallback-atom]} opts]
+  (if-let [c @client-atom]
+    (guarded-read :count-entries
+                  #(count-live! (deadline/read-client c config)
+                                (:collection-name config default-collection) opts))
+    (long (count (fallback-matches fallback-atom opts)))))
+
+(defn- query-page*
+  [{:keys [config client-atom fallback-atom]} {:keys [limit cursor] :or {limit 100} :as opts}]
+  (if-let [c @client-atom]
+    (guarded-read :query-page
+                  #(page-live! (deadline/read-client c config)
+                               (:collection-name config default-collection) opts))
+    (let [after (cond->> (fallback-matches fallback-atom opts)
+                  cursor (drop-while #(neg? (compare (str (:id %)) cursor)))
+                  cursor (drop-while #(= (str (:id %)) cursor)))
+          page  (take limit after)]
+      {:rows        (mapv #(project-row opts %) page)
+       :next-cursor (when (seq (drop limit after)) (str (:id (last page))))})))
+
+(when-let [p (some-> (ns-resolve 'hive-spi.memory.ports 'IMemoryStoreCount) deref)]
+  (extend QdrantMemoryStore p {:count-entries count-entries*}))
+
+(when-let [p (some-> (ns-resolve 'hive-spi.memory.ports 'IMemoryStorePage) deref)]
+  (extend QdrantMemoryStore p {:query-page query-page*}))
 
 (defn create-store
   "Construct a QdrantMemoryStore. Does NOT open a connection —
