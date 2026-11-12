@@ -300,14 +300,59 @@
     (mapv folded order)))
 
 ;; =============================================================================
+;; Live writes queue behind older writes of their entry
+;; =============================================================================
+
+(def ^:private in-flight
+  "Coalesce keys of the ops the running drain pass took off the queue and
+   has not settled yet. They are no longer in the queue, but still older
+   than any write that arrives meanwhile."
+  (atom #{}))
+
+(def ^:dynamic *replaying*
+  "True while a drain pass replays a queued op. Its writes go straight to
+   qdrant: they ARE the older write a live one must wait for."
+  false)
+
+(defn pending?
+  "True when a write on OP's entry (the same :collection and :id) is queued,
+   or taken by the running drain pass and not settled yet. An op without an
+   :id names no entry and is never pending."
+  [op]
+  (boolean
+   (when (some? (:id op))
+     (let [k (coalesce-key op)]
+       (or (contains? @in-flight k)
+           (some #(= k (coalesce-key %)) @the-queue))))))
+
+(defn enqueue-behind-pending!
+  "Queue OP when an older write of its entry still waits for replay, and
+   answer what `enqueue!` answers; nil when nothing of that entry waits, so
+   the caller writes directly.
+
+   Written directly, OP would land first and the older op, replayed later,
+   would overwrite it. Queued, it replays after it, in the order the calls
+   were made. The check and the enqueue hold the lock a drain pass takes its
+   snapshot and settles under, so OP cannot slip between them. A replay
+   (`*replaying*`) never queues behind itself."
+  [op]
+  (when-not *replaying*
+    (locking disk-lock
+      (when (pending? op)
+        (enqueue! op)))))
+
+;; =============================================================================
 ;; Drain (single-writer via core.async)
 ;; =============================================================================
 
 (defn- run-op
-  "Execute one queued op via dispatch-fn. Returns ::ok or ::failed."
+  "Execute one queued op via dispatch-fn. Returns ::ok or ::failed.
+   The op runs with *replaying* bound, so the store writes it through and
+   does not queue it behind itself (`enqueue-behind-pending!`)."
   [dispatch-fn op]
   (try
-    (dispatch-fn op)
+    (binding [*replaying* true]
+      (dispatch-fn op))
     ::ok
     (catch Throwable e
       (log/warn "hive-qdrant.queue drain op failed:" (:op op) "/" (:id op)
@@ -320,9 +365,18 @@
 
    The attached outbox keeps the snapshot's ops until the pass settles and is
    rewritten only then, to the failed ops plus whatever queued meanwhile: a
-   crash mid-pass replays the pass again rather than losing it."
+   crash mid-pass replays the pass again rather than losing it.
+
+   The snapshot's entry keys stay `in-flight` until the pass settles, so a
+   live write of one of those entries queues behind it (`pending?`) rather
+   than landing before the older op replays."
   [dispatch-fn]
-  (let [[snapshot _] (swap-vals! the-queue (constantly PersistentQueue/EMPTY))
+  (let [snapshot     (locking disk-lock
+                       (let [[snapshot _] (swap-vals! the-queue (constantly PersistentQueue/EMPTY))]
+                         (reset! in-flight (into #{} (comp (filter #(some? (:id %)))
+                                                           (map coalesce-key))
+                                                 snapshot))
+                         snapshot))
         batch        (coalesce (vec snapshot))
         _            (log/info "hive-qdrant.queue drain pass: coalesced"
                                (count snapshot) "→" (count batch))
@@ -345,6 +399,7 @@
         ;; Back AHEAD of anything queued while this pass ran: those ops are
         ;; newer, and a failed op replayed after them would undo them.
         (swap! the-queue #(into (into PersistentQueue/EMPTY failed-ops) %)))
+      (reset! in-flight #{})
       (sync-outbox!))
     (swap! metrics (fn [m]
                      (-> m
