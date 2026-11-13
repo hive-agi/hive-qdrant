@@ -327,11 +327,23 @@
 ;; Resilient wrapper — circuit + queue
 ;; =============================================================================
 
+(declare resilient-now)
+
 (defn- resilient
   "Run (thunk) under the circuit breaker. On success, record-success!
    and return the value. On failure, classify + record-failure!. If
-   queue-op is provided and failure is transient, enqueue for replay."
+   queue-op is provided and failure is transient, enqueue for replay.
+
+   A queue-op whose entry still has an older write waiting for replay is
+   queued behind it and not run: run now, it would land first and the older
+   op, replayed later, would overwrite it."
   ([thunk] (resilient thunk nil))
+  ([thunk queue-op]
+   (if-let [queued (some-> queue-op queue/enqueue-behind-pending!)]
+     queued
+     (resilient-now thunk queue-op))))
+
+(defn- resilient-now
   ([thunk queue-op]
    (if-let [gate (circuit/check)]
      ;; circuit open — fail-soft
@@ -624,21 +636,27 @@
     ;; which embeds it in place of :content and never stores it. `existing`
     ;; carries none (reads drop it), so updates without one embed :content
     ;; exactly as before: the new :content when given, else the stored one.
-    (let [existing (proto/get-entry this id)]
-      (cond
-        (nil? existing)
-        (do (log/debug "hive-qdrant update-entry!: no entry" {:id id})
-            nil)
+    ;;
+    ;; An older write of this entry still waiting for replay goes first: the
+    ;; updates queue behind it, as they do when the read fails.
+    (let [queue-op {:op :update-entry! :id id :args [id updates]
+                    :collection (:collection-name config default-collection)}]
+      (or (queue/enqueue-behind-pending! queue-op)
+          (let [existing (proto/get-entry this id)]
+            (cond
+              (nil? existing)
+              (do (log/debug "hive-qdrant update-entry!: no entry" {:id id})
+                  nil)
 
-        (read-failure? existing)
-        (if (:reconnecting? existing)
-          (queue/enqueue! {:op :update-entry! :id id :args [id updates] :collection (:collection-name config default-collection)})
-          existing)
+              (read-failure? existing)
+              (if (:reconnecting? existing)
+                (queue/enqueue! queue-op)
+                existing)
 
-        :else
-        (let [merged (merge existing updates {:id id})
-              r      (proto/add-entry! this merged)]
-          (if (string? r) (strip-transient merged) r)))))
+              :else
+              (let [merged (merge existing updates {:id id})
+                    r      (proto/add-entry! this merged)]
+                (if (string? r) (strip-transient merged) r)))))))
 
   (delete-entry! [_this id]
     (resilient
