@@ -41,7 +41,8 @@
             [taoensso.timbre :as log]
             [hive-qdrant.connect :as connect])
   (:import [io.qdrant.client WithPayloadSelectorFactory]
-           [io.qdrant.client.grpc Points$ScrollPoints]
+           [io.qdrant.client.grpc Points$FacetCounts Points$FacetHit Points$FacetValue
+            Points$ScrollPoints]
            [java.util List UUID]))
 
 ;; =============================================================================
@@ -92,8 +93,14 @@
                 to the in-memory fallback. A decorator that changes :content
                 at rest (hive-knowledge's seal encrypts it) hands the store the
                 text it may index this way; without it the collection would
-                index ciphertext."
-  [:embed-text])
+                index ciphertext.
+
+   :distinct-values  `distinct-values` answers every distinct value of one
+                payload field with its point count, exactly, over the gRPC
+                facet under the read deadline and the circuit breaker. It
+                never answers a truncated list: more values than :limit
+                throws :qdrant/distinct-values-truncated."
+  [:embed-text :distinct-values])
 
 (defn- transient-key?
   "True for a key that lands in the payload field \"embed-text\", or in a
@@ -1239,6 +1246,71 @@
 
 (when-let [p (some-> (ns-resolve 'hive-spi.memory.ports 'IMemoryStorePage) deref)]
   (extend QdrantMemoryStore p {:query-page query-page*}))
+
+;; =============================================================================
+;; :distinct-values: every value of one payload field, with its count
+;; =============================================================================
+
+(def ^:const default-distinct-limit
+  "Most distinct values `distinct-values` answers before it refuses."
+  100000)
+
+(defprotocol IDistinctValues
+  (distinct-values [this field opts]
+    "Every distinct value of payload FIELD (string or keyword) among the
+     points matching OPTS (query-entries' filter keys), each once, as
+     [{:value v :count n}] by count descending. Exact: when there are more
+     than (:limit opts 100000) values it throws
+     :qdrant/distinct-values-truncated instead of answering a prefix. A
+     failed read throws; it never answers []."))
+
+(defn- facet-value
+  "The Clojure value of a FacetValue: a string, a long or a boolean."
+  [^Points$FacetValue v]
+  (cond
+    (.hasStringValue v)  (.getStringValue v)
+    (.hasIntegerValue v) (.getIntegerValue v)
+    (.hasBoolValue v)    (.getBoolValue v)))
+
+(defn- facet-live!
+  "Boundary: IO. One exact facet RPC over FIELD asking for LIMIT values."
+  [client collection-name field limit opts]
+  (let [b (-> (Points$FacetCounts/newBuilder)
+              (.setCollectionName ^String collection-name)
+              (.setKey ^String field)
+              (.setLimit (long limit))
+              (.setExact true))
+        _ (when-let [f (live-filter opts)] (.setFilter b f))]
+    (mapv (fn [^Points$FacetHit h] {:value (facet-value (.getValue h)) :count (.getCount h)})
+          (.get (.facetAsync (:client client) (.build b))))))
+
+(defn- fallback-distinct
+  "Mechanism: pure. The distinct values of FIELD over in-memory ENTRIES, a
+   list value counting each of its elements, by count descending."
+  [entries field]
+  (let [k (keyword field)]
+    (->> entries
+         (mapcat #(let [v (get % k)] (if (sequential? v) (distinct v) (some-> v vector))))
+         frequencies
+         (map (fn [[v n]] {:value v :count (long n)}))
+         (sort-by (juxt (comp - :count) (comp str :value)))
+         vec)))
+
+(defn- distinct-values*
+  [{:keys [config client-atom fallback-atom]} field {:keys [limit] :or {limit default-distinct-limit} :as opts}]
+  (let [field (name field)
+        hits  (if-let [c @client-atom]
+                (guarded-read :distinct-values
+                              #(facet-live! (deadline/read-client c config)
+                                            (:collection-name config default-collection)
+                                            field (inc limit) opts))
+                (fallback-distinct (fallback-matches fallback-atom opts) field))]
+    (when (> (count hits) limit)
+      (throw (ex-info (str "qdrant distinct-values: " field " has more than " limit " values")
+                      {:error :qdrant/distinct-values-truncated :field field :limit limit})))
+    hits))
+
+(extend QdrantMemoryStore IDistinctValues {:distinct-values distinct-values*})
 
 (defn create-store
   "Construct a QdrantMemoryStore. Does NOT open a connection —

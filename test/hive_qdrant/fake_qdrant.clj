@@ -23,8 +23,9 @@
      (def c (client))
      (reset! (:client-atom store) {:client c})
      (reset! (:connected?-atom store) true)"
-  (:import [io.qdrant.client.grpc Collections$CreateCollection
-            Points$DenseVector Points$PointStruct
+  (:import [io.qdrant.client.grpc Collections$CreateCollection JsonWithInt$Value
+            Points$DenseVector Points$FacetCounts Points$FacetHit Points$FacetValue
+            Points$PointStruct
             Points$RetrievedPoint Points$ScoredPoint Points$ScrollPoints
             Points$ScrollResponse Points$SearchPoints
             Points$VectorOutput Points$VectorsOutput]
@@ -37,6 +38,7 @@
   (searchAsync [request])
   (scrollAsync [request])
   (countAsync [collection filter exact])
+  (facetAsync [request])
   (deleteAsync [collection ids-or-filter])
   (collectionExistsAsync [collection])
   (createCollectionAsync [request])
@@ -139,6 +141,29 @@
       (done (.build b))))
   (countAsync [_ _collection _filter _exact]
     (done (long (count @store))))
+  (facetAsync [_ request]
+    ;; Counts the string values of the request's key, a list counting each
+    ;; element, and cuts at the limit WITHOUT saying so, as qdrant does.
+    ;; Ignores the filter, like search and scroll.
+    (let [^Points$FacetCounts req request
+          k    (.getKey req)
+          seen (mapcat (fn [^Points$PointStruct ps]
+                         (let [v (get (.getPayloadMap ps) k)]
+                           (cond
+                             (nil? v) []
+                             (.hasListValue ^JsonWithInt$Value v)
+                             (distinct (map #(.getStringValue ^JsonWithInt$Value %)
+                                            (.. ^JsonWithInt$Value v getListValue getValuesList)))
+                             :else [(.getStringValue ^JsonWithInt$Value v)])))
+                       (vals @store))]
+      (done (->> (frequencies seen)
+                 (sort-by (juxt (comp - val) key))
+                 (take (.getLimit req))
+                 (mapv (fn [[s n]]
+                         (-> (Points$FacetHit/newBuilder)
+                             (.setValue (-> (Points$FacetValue/newBuilder) (.setStringValue s) .build))
+                             (.setCount (long n))
+                             .build)))))))
   (deleteAsync [_ _collection ids-or-filter]
     (when (instance? List ids-or-filter)
       (swap! store #(apply dissoc % (map point-key ids-or-filter))))
@@ -187,6 +212,7 @@
       (searchAsync [_ _] (boom))
       (scrollAsync [_ _] (boom))
       (countAsync [_ _ _ _] (boom))
+      (facetAsync [_ _] (boom))
       (deleteAsync [_ _ _] (boom))
       (collectionExistsAsync [_ _] (boom))
       (createCollectionAsync [_ _] (boom))
@@ -207,6 +233,7 @@
     (searchAsync [_ request] (.searchAsync c request))
     (scrollAsync [_ request] (.scrollAsync c request))
     (countAsync [_ collection filter exact] (.countAsync c collection filter exact))
+    (facetAsync [_ request] (.facetAsync c request))
     (deleteAsync [_ collection ids-or-filter] (.deleteAsync c collection ids-or-filter))
     (collectionExistsAsync [_ collection] (.collectionExistsAsync c collection))
     (createCollectionAsync [_ request] (.createCollectionAsync c request))
