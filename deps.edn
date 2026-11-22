@@ -41,7 +41,7 @@
                       ;; Only addon_test is host-coupled; hive-mcp needs
                       ;; hive-help on the classpath to load. Test-scope only —
                       ;; the published core requires neither.
-                      io.github.hive-agi/hive-mcp {:mvn/version "1.18.0"}
+                      io.github.hive-agi/hive-mcp {:mvn/version "1.18.1"}
                       io.github.hive-agi/hive-help {:mvn/version "0.2.1"}
                       ;; hive-spi.memory.conformance and .decorate (the
                       ;; :embed-text contract) ship from 1.4.0. Test-scope:
@@ -54,5 +54,5 @@
   ;; Clojars publishing. `clojure -T:build <jar|install|deploy>`.
   ;; Version = VERSION file; version.edn carries the coordinates,
   ;; :jar-excludes (host-integration nses) and :pom-exclude-deps.
-  :build {:deps {io.github.hive-agi/hive-build {:mvn/version "0.3.1"}}
+  :build {:deps {io.github.hive-agi/hive-build {:mvn/version "0.3.3"}}
           :ns-default hive-build.api}}}
