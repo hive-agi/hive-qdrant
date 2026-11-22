@@ -81,6 +81,28 @@
   [config default-id]
   (or (:addon/id config) (:addon-id config) default-id))
 
+(host/defsoft space-for-resolved
+  'hive-mcp.embeddings.service/space-for-resolved
+  :absent (constantly nil)
+  :doc "The EmbeddingSpace of a resolved provider (provider, model, exact
+   digest, dimension, revisions), or nil. Soft-resolved like
+   `resolve-provider-for-type`: absent host means no nameable space, and the
+   collection is neither stamped nor checked.")
+
+(defn- embedding-space
+  "The EmbeddingSpace the slot's vectors live in, for a slot whose manifest
+   opts into `:embed-type`; nil for a zero-vector slot (no embed-type), an
+   absent host, or a provider whose space cannot be named. Never throws: a
+   failed lookup only leaves the collection unguarded, and says so."
+  [embed-type]
+  (when embed-type
+    (try
+      (some-> (resolve-provider-for-type (keyword embed-type)) space-for-resolved)
+      (catch Throwable t
+        (log/warn "hive-qdrant: embedding space of" embed-type
+                  "could not be named; collection provenance unguarded:" (ex-message t))
+        nil))))
+
 (defn- make-embedder
   "Build the injected snippet embedder for a slot, or nil.
 
@@ -174,6 +196,8 @@
                                 ;; operator may override without being part
                                 ;; of the typed QdrantConfig surface.
                                 (select-keys config [:vector-size :distance]))
+                space    (embedding-space (:embed-type config))
+                resolved (cond-> resolved space (assoc :embedding-space space))
                 embedder (make-embedder (:embed-type config))
                 store    (store/create-store
                           (cond-> (select-keys resolved [:host :port :collection-name :api-key :tls? :vector-size :distance :read-deadline-ms :search-deadline-ms :write-deadline-ms])
