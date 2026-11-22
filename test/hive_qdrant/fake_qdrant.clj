@@ -23,7 +23,8 @@
      (def c (client))
      (reset! (:client-atom store) {:client c})
      (reset! (:connected?-atom store) true)"
-  (:import [io.qdrant.client.grpc Collections$CreateCollection JsonWithInt$Value
+  (:import [io.qdrant.client.grpc Collections$CollectionConfig Collections$CollectionInfo
+            Collections$CreateCollection JsonWithInt$Value
             Points$DenseVector Points$FacetCounts Points$FacetHit Points$FacetValue
             Points$PointStruct
             Points$RetrievedPoint Points$ScoredPoint Points$ScrollPoints
@@ -41,6 +42,7 @@
   (facetAsync [request])
   (deleteAsync [collection ids-or-filter])
   (collectionExistsAsync [collection])
+  (getCollectionInfoAsync [collection])
   (createCollectionAsync [request])
   (deleteCollectionAsync [collection]))
 
@@ -100,7 +102,7 @@
       (.setScore (float score))
       .build))
 
-(deftype FakeQdrant [store vector-field collections creates]
+(deftype FakeQdrant [store vector-field collections creates metadata]
   IFakeQdrant
   (upsertAsync [_ _collection points]
     (swap! store into (map (fn [^Points$PointStruct ps] [(point-key (.getId ps)) ps])) points)
@@ -170,9 +172,22 @@
     (done nil))
   (collectionExistsAsync [_ collection]
     (done (contains? @collections collection)))
+  (getCollectionInfoAsync [_ collection]
+    (if (contains? @collections collection)
+      (done (-> (Collections$CollectionInfo/newBuilder)
+                (.setConfig (-> (Collections$CollectionConfig/newBuilder)
+                                (.putAllMetadata (get @metadata collection {}))
+                                .build))
+                .build))
+      (throw (RuntimeException. (str "NOT_FOUND: collection " collection)))))
   (createCollectionAsync [_ request]
     (swap! creates inc)
-    (swap! collections conj (.getCollectionName ^Collections$CreateCollection request))
+    (let [^Collections$CreateCollection req request
+          n (.getCollectionName req)]
+      (if (contains? @collections n)
+        (throw (RuntimeException. (str "ALREADY_EXISTS: collection " n)))
+        (do (swap! collections conj n)
+            (swap! metadata assoc n (into {} (.getMetadataMap req))))))
     (done nil))
   (deleteCollectionAsync [_ collection]
     (swap! collections disj collection)
@@ -187,7 +202,23 @@
    call, see `create-calls`."
   ([] (client {}))
   ([{:keys [vector-field] :or {vector-field :dense}}]
-   (->FakeQdrant (atom {}) vector-field (atom #{}) (atom 0))))
+   (->FakeQdrant (atom {}) vector-field (atom #{}) (atom 0) (atom {}))))
+
+(defn metadata
+  "The qdrant metadata map (string -> JsonWithInt$Value) collection COLL was
+   created with on the fake C, or nil when C holds no such collection."
+  [^FakeQdrant c coll]
+  (when (contains? @(.-collections c) coll)
+    (get @(.-metadata c) coll {})))
+
+(defn seed-collection!
+  "Make collection COLL exist on the fake C with qdrant metadata MD (string
+   -> JsonWithInt$Value; {} for a legacy, unstamped collection), as if a
+   previous process had created it. Counts no create call."
+  [^FakeQdrant c coll md]
+  (swap! (.-collections c) conj coll)
+  (swap! (.-metadata c) assoc coll md)
+  c)
 
 (defn create-calls
   "How many times createCollectionAsync reached the fake C, whether or not

@@ -142,7 +142,8 @@
   (searchAsync [request])
   (countAsync [collection filter exact])
   (facetAsync [request])
-  (collectionExistsAsync [collection]))
+  (collectionExistsAsync [collection])
+  (getCollectionInfoAsync [collection]))
 
 (defn- bounded-view
   "A read-only view of QC whose every call carries the deadline D."
@@ -165,7 +166,9 @@
     (facetAsync [_ request]
       (.facetAsync qc ^Points$FacetCounts request d))
     (collectionExistsAsync [_ collection]
-      (.collectionExistsAsync qc ^String collection d))))
+      (.collectionExistsAsync qc ^String collection d))
+    (getCollectionInfoAsync [_ collection]
+      (.getCollectionInfoAsync qc ^String collection d))))
 
 (defn bounded
   "CLIENT-MAP with its :client replaced by a read view under a deadline of
