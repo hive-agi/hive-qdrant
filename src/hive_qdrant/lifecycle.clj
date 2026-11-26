@@ -13,7 +13,7 @@
    arrives."
   ;; Copyright (C) 2026 Pedro Gomes Branquinho (BuddhiLW) <pedrogbranquinho@gmail.com>
   ;;
-  ;; SPDX-License-Identifier: AGPL-3.0-or-later
+  ;; SPDX-License-Identifier: MIT
   (:require [hive-spi.lifecycle.ports :as lifecycle]
             [hive-spi.lifecycle.registry :as reg]
             [taoensso.timbre :as log]))
