@@ -23,8 +23,10 @@
      (def c (client))
      (reset! (:client-atom store) {:client c})
      (reset! (:connected?-atom store) true)"
-  (:import [io.qdrant.client.grpc Collections$CreateCollection
-            Points$DenseVector Points$PointStruct
+  (:import [io.qdrant.client.grpc Collections$CollectionConfig Collections$CollectionInfo
+            Collections$CreateCollection JsonWithInt$Value
+            Points$DenseVector Points$FacetCounts Points$FacetHit Points$FacetValue
+            Points$PointStruct
             Points$RetrievedPoint Points$ScoredPoint Points$ScrollPoints
             Points$ScrollResponse Points$SearchPoints
             Points$VectorOutput Points$VectorsOutput]
@@ -37,8 +39,10 @@
   (searchAsync [request])
   (scrollAsync [request])
   (countAsync [collection filter exact])
+  (facetAsync [request])
   (deleteAsync [collection ids-or-filter])
   (collectionExistsAsync [collection])
+  (getCollectionInfoAsync [collection])
   (createCollectionAsync [request])
   (deleteCollectionAsync [collection]))
 
@@ -98,7 +102,7 @@
       (.setScore (float score))
       .build))
 
-(deftype FakeQdrant [store vector-field collections creates]
+(deftype FakeQdrant [store vector-field collections creates metadata]
   IFakeQdrant
   (upsertAsync [_ _collection points]
     (swap! store into (map (fn [^Points$PointStruct ps] [(point-key (.getId ps)) ps])) points)
@@ -139,15 +143,51 @@
       (done (.build b))))
   (countAsync [_ _collection _filter _exact]
     (done (long (count @store))))
+  (facetAsync [_ request]
+    ;; Counts the string values of the request's key, a list counting each
+    ;; element, and cuts at the limit WITHOUT saying so, as qdrant does.
+    ;; Ignores the filter, like search and scroll.
+    (let [^Points$FacetCounts req request
+          k    (.getKey req)
+          seen (mapcat (fn [^Points$PointStruct ps]
+                         (let [v (get (.getPayloadMap ps) k)]
+                           (cond
+                             (nil? v) []
+                             (.hasListValue ^JsonWithInt$Value v)
+                             (distinct (map #(.getStringValue ^JsonWithInt$Value %)
+                                            (.. ^JsonWithInt$Value v getListValue getValuesList)))
+                             :else [(.getStringValue ^JsonWithInt$Value v)])))
+                       (vals @store))]
+      (done (->> (frequencies seen)
+                 (sort-by (juxt (comp - val) key))
+                 (take (.getLimit req))
+                 (mapv (fn [[s n]]
+                         (-> (Points$FacetHit/newBuilder)
+                             (.setValue (-> (Points$FacetValue/newBuilder) (.setStringValue s) .build))
+                             (.setCount (long n))
+                             .build)))))))
   (deleteAsync [_ _collection ids-or-filter]
     (when (instance? List ids-or-filter)
       (swap! store #(apply dissoc % (map point-key ids-or-filter))))
     (done nil))
   (collectionExistsAsync [_ collection]
     (done (contains? @collections collection)))
+  (getCollectionInfoAsync [_ collection]
+    (if (contains? @collections collection)
+      (done (-> (Collections$CollectionInfo/newBuilder)
+                (.setConfig (-> (Collections$CollectionConfig/newBuilder)
+                                (.putAllMetadata (get @metadata collection {}))
+                                .build))
+                .build))
+      (throw (RuntimeException. (str "NOT_FOUND: collection " collection)))))
   (createCollectionAsync [_ request]
     (swap! creates inc)
-    (swap! collections conj (.getCollectionName ^Collections$CreateCollection request))
+    (let [^Collections$CreateCollection req request
+          n (.getCollectionName req)]
+      (if (contains? @collections n)
+        (throw (RuntimeException. (str "ALREADY_EXISTS: collection " n)))
+        (do (swap! collections conj n)
+            (swap! metadata assoc n (into {} (.getMetadataMap req))))))
     (done nil))
   (deleteCollectionAsync [_ collection]
     (swap! collections disj collection)
@@ -162,7 +202,23 @@
    call, see `create-calls`."
   ([] (client {}))
   ([{:keys [vector-field] :or {vector-field :dense}}]
-   (->FakeQdrant (atom {}) vector-field (atom #{}) (atom 0))))
+   (->FakeQdrant (atom {}) vector-field (atom #{}) (atom 0) (atom {}))))
+
+(defn metadata
+  "The qdrant metadata map (string -> JsonWithInt$Value) collection COLL was
+   created with on the fake C, or nil when C holds no such collection."
+  [^FakeQdrant c coll]
+  (when (contains? @(.-collections c) coll)
+    (get @(.-metadata c) coll {})))
+
+(defn seed-collection!
+  "Make collection COLL exist on the fake C with qdrant metadata MD (string
+   -> JsonWithInt$Value; {} for a legacy, unstamped collection), as if a
+   previous process had created it. Counts no create call."
+  [^FakeQdrant c coll md]
+  (swap! (.-collections c) conj coll)
+  (swap! (.-metadata c) assoc coll md)
+  c)
 
 (defn create-calls
   "How many times createCollectionAsync reached the fake C, whether or not
@@ -187,6 +243,7 @@
       (searchAsync [_ _] (boom))
       (scrollAsync [_ _] (boom))
       (countAsync [_ _ _ _] (boom))
+      (facetAsync [_ _] (boom))
       (deleteAsync [_ _ _] (boom))
       (collectionExistsAsync [_ _] (boom))
       (createCollectionAsync [_ _] (boom))
@@ -207,6 +264,7 @@
     (searchAsync [_ request] (.searchAsync c request))
     (scrollAsync [_ request] (.scrollAsync c request))
     (countAsync [_ collection filter exact] (.countAsync c collection filter exact))
+    (facetAsync [_ request] (.facetAsync c request))
     (deleteAsync [_ collection ids-or-filter] (.deleteAsync c collection ids-or-filter))
     (collectionExistsAsync [_ collection] (.collectionExistsAsync c collection))
     (createCollectionAsync [_ request] (.createCollectionAsync c request))

@@ -22,7 +22,8 @@
 
    Deadlines, in milliseconds, come from the store config:
 
-     :read-deadline-ms    retrieve, scroll, count   (default 15000)
+     :read-deadline-ms    retrieve, scroll, count,  (default 15000)
+                          facet
      :search-deadline-ms  search                    (default 60000)
      :write-deadline-ms   upsert, delete, creates   (default 30000)
 
@@ -54,7 +55,7 @@
             WithPayloadSelectorFactory WithVectorsSelectorFactory]
            [io.qdrant.client.grpc Collections$CreateCollection
             Collections$PayloadIndexParams Collections$PayloadSchemaType
-            Common$Filter Points$ReadConsistency Points$ScrollPoints
+            Common$Filter Points$FacetCounts Points$ReadConsistency Points$ScrollPoints
             Points$SearchPoints Points$WriteOrderingType]
            [java.time Duration]
            [java.util List]))
@@ -140,7 +141,9 @@
   (scrollAsync [request])
   (searchAsync [request])
   (countAsync [collection filter exact])
-  (collectionExistsAsync [collection]))
+  (facetAsync [request])
+  (collectionExistsAsync [collection])
+  (getCollectionInfoAsync [collection]))
 
 (defn- bounded-view
   "A read-only view of QC whose every call carries the deadline D."
@@ -160,8 +163,12 @@
       (.searchAsync qc ^Points$SearchPoints request d))
     (countAsync [_ collection filter exact]
       (.countAsync qc ^String collection ^Common$Filter filter ^Boolean exact d))
+    (facetAsync [_ request]
+      (.facetAsync qc ^Points$FacetCounts request d))
     (collectionExistsAsync [_ collection]
-      (.collectionExistsAsync qc ^String collection d))))
+      (.collectionExistsAsync qc ^String collection d))
+    (getCollectionInfoAsync [_ collection]
+      (.getCollectionInfoAsync qc ^String collection d))))
 
 (defn bounded
   "CLIENT-MAP with its :client replaced by a read view under a deadline of

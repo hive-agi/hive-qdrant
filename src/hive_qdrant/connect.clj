@@ -14,8 +14,10 @@
      silent     (connected, answers nothing) open! throws, and connect! fails"
   (:require [clj-qdrant.schema :as q-schema]
             [hive-qdrant.deadline :as deadline]
+            [hive-qdrant.space :as espace]
             [taoensso.timbre :as log])
-  (:import [java.util.concurrent Future TimeUnit]
+  (:import [io.qdrant.client.grpc Collections$CreateCollection]
+           [java.util.concurrent Future TimeUnit]
 [java.util.concurrent TimeoutException]))
 
 (defn open!
@@ -82,6 +84,37 @@
       (log/debug "collection-exists? probe failed:" (ex-message t))
       nil)))
 
+(defn- create-collection!
+  "Send a CreateCollection for NAME through the write client WRITER: a single
+   unnamed vector of VECTOR-SIZE under DISTANCE, stamped with SPACE in the
+   collection metadata when SPACE is given. clj-qdrant's collection-create!
+   carries no metadata, so the request is built here."
+  [writer {:keys [name vector-size distance space]}]
+  (let [b (-> (Collections$CreateCollection/newBuilder)
+              (.setCollectionName ^String name)
+              (.setVectorsConfig (q-schema/vectors-config {:size vector-size :distance distance})))]
+    (when space
+      (.putAllMetadata b ^java.util.Map (espace/space->qdrant-metadata space)))
+    (.get ^Future (.createCollectionAsync (:client writer) (.build b)))
+    {:name name :vector-size vector-size :distance distance :stamped? (some? space)}))
+
+(defn- admit-existing!
+  "Guard the existing collection COLLECTION-NAME for vectors of SPACE (see
+   `ensure-collection!`). Throws :embedding-space-mismatch on another space,
+   :qdrant/unresponsive on a metadata read past its deadline; any other
+   failed read is logged and the collection admitted unverified."
+  [client-map collection-name space]
+  (let [md (try
+             (espace/collection-metadata
+              (deadline/bounded client-map exists-probe-timeout-ms) collection-name)
+             (catch Throwable t
+               (when (timed-out? t) (throw (unresponsive "collection metadata read" t)))
+               (log/warn "hive-qdrant: could not read the embedding space of"
+                         collection-name "- admitting it unverified:" (ex-message t))
+               ::unread))]
+    (when-not (= ::unread md)
+      (espace/admit! collection-name space md))))
+
 (defn ensure-collection!
   "Create the collection if missing + ensure payload indexes.
 
@@ -92,6 +125,23 @@
    concurrent creator may still win the race, and that 'already exists'
    stays benign.
 
+   With :embedding-space in CFG (an EmbeddingSpace; its :metric is taken
+   from :distance) the collection's provenance is guarded too:
+
+     created now          stamped with the space in its qdrant metadata
+     exists, same space   admitted
+     exists, no stamp     legacy: admitted, warned once per collection
+     exists, other space  throws ex-info :embedding-space-mismatch (both
+                          spaces, the differing keys, :collection, remedy
+                          #{:isolate :re-embed}), so connect! fails rather
+                          than mixing two spaces in one collection
+
+   A metadata read the store does not answer in time throws
+   :qdrant/unresponsive; any other failed read leaves the space unverified,
+   logged, and admitted like a legacy collection. Without :embedding-space
+   (no nameable space, or a distance with no space metric) nothing is
+   stamped or checked.
+
    Every RPC here is bounded: the probe by `exists-probe-timeout-ms`, the
    creates by the write deadline (`deadline/write-client`). One the store
    does not answer in time throws :qdrant/unresponsive, so connect! fails
@@ -101,22 +151,26 @@
    A client opened on a store it could not reach (`:reached? false`) sends
    nothing: every create would fail, or wait out its deadline for a
    connection that is not coming."
-  [client-map {:keys [collection-name vector-size distance]
+  [client-map {:keys [collection-name vector-size distance embedding-space]
                :or   {distance :cosine}
                :as   cfg}]
   (if (false? (:reached? client-map))
     (log/warn "hive-qdrant: qdrant unreachable at connect;" collection-name
               "is not ensured, writes go to the replay queue")
-    (let [writer (deadline/write-client client-map cfg)]
-      (when-not (true? (collection-exists? client-map collection-name))
+    (let [writer  (deadline/write-client client-map cfg)
+          space   (espace/space-for-distance embedding-space distance)
+          exists? (true? (collection-exists? client-map collection-name))]
+      (if exists?
+        (when space (admit-existing! client-map collection-name space))
         (try
-          (q-schema/collection-create! writer
-                                       {:name        collection-name
-                                        :vector-size vector-size
-                                        :distance    distance})
+          (create-collection! writer {:name        collection-name
+                                      :vector-size vector-size
+                                      :distance    distance
+                                      :space       space})
           (catch Throwable t
             (when (timed-out? t) (throw (unresponsive "collection create" t)))
             (log/debug "collection-create! soft-failed (likely already exists):"
                        (ex-message t))
+            (when space (admit-existing! client-map collection-name space))
             nil)))
       (ensure-payload-indexes! writer collection-name))))
